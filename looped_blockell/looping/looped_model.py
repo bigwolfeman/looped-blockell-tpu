@@ -77,6 +77,7 @@ class LoopedTransformer(nn.Module):
         k_max: int,
         labels: Optional[jnp.ndarray] = None,
         deterministic: bool = True,
+        use_iter_embed: bool = False,
     ) -> dict:
         """Forward pass.
 
@@ -121,16 +122,8 @@ class LoopedTransformer(nn.Module):
         e = RMSNorm(cfg.norm_eps, name="input_norm")(x)  # [B, S, d_model]
 
         # ── 4. Recurrent state init — truncated normal (Parcae-style) ────────
-        # In Flax @nn.compact we can't call make_rng during normal forward
-        # because we're in the params collection. Use a mutable param instead.
-        # Actually the spec says to use make_rng('params') — fine in init,
-        # but at inference time we need a reproducible init. Use zeros and
-        # let the injection gate open naturally (decay * 0 + dt * e = dt * e).
-        #
-        # Rationale: the model is trained with random h init, but at inference
-        # the hidden state converges quickly due to decay < 1. Zeros on first
-        # token gives the same asymptotic behavior after 1-2 iterations.
-        h = jnp.zeros_like(e)                    # [B, S, d_model]
+        h = jax.random.normal(self.make_rng("state"), e.shape, dtype=jnp.float32) * 0.02
+        h = h.astype(e.dtype)
 
         # ── 5. Build core blocks (shared weights across loop iterations) ──────
         # In Flax @nn.compact, modules created here get their params under
@@ -146,17 +139,15 @@ class LoopedTransformer(nn.Module):
             name="injection",
         )
 
-        # Optional per-iteration embedding (Phase C routing conditioning)
-        # Created only if n_clusters > 0 as a proxy for routing being enabled.
-        # The embedding is near-zero init to not disturb the pretrained model.
-        has_iter_embed = cfg.n_clusters > 0
-        if has_iter_embed:
-            iter_embed = nn.Embed(
-                num_embeddings=cfg.max_depth,
-                features=cfg.d_model,
-                embedding_init=nn.initializers.normal(stddev=0.001),
-                name="iteration_embed",
-            )
+        # Per-iteration embedding (Phase C routing conditioning).
+        # Always created so params exist, but only USED when routing is active.
+        # Near-zero init to avoid perturbing the pre-routing model.
+        iter_embed = nn.Embed(
+            num_embeddings=cfg.max_depth,
+            features=cfg.d_model,
+            embedding_init=nn.initializers.normal(stddev=0.001),
+            name="iteration_embed",
+        )
 
         # ── 6. lax.scan core loop ─────────────────────────────────────────────
         # Carry = h  [B, S, d_model]
@@ -173,39 +164,26 @@ class LoopedTransformer(nn.Module):
         # during backward instead of storing them — O(1) memory per step.
 
         def scan_body(h_carry, step_idx):
-            """One looped iteration.
+            is_nograd = step_idx < n_max
 
-            Args:
-                h_carry:  Current hidden state  [B, S, d_model]
-                step_idx: Current step (scalar int32, JAX traced)
+            # ── Injection ───
+            h_new = injection(h_carry, e)
 
-            Returns:
-                (h_next, None)  — scan output is None (we only care about carry)
-            """
-            # ── Injection ────────────────────────────────────────────────────
-            h_new = injection(h_carry, e)         # [B, S, d_model]
-
-            # ── Optional iteration embedding (Phase C) ────────────────────────
-            if has_iter_embed:
+            # ── Iteration embedding (only during Phase C routing) ───
+            if use_iter_embed:
                 t_clamped = jnp.minimum(step_idx, cfg.max_depth - 1)
-                # Broadcast iter embed over batch: [d_model] → [B, S, d_model]
-                iter_vec = iter_embed(t_clamped)                  # [d_model]
+                iter_vec = iter_embed(t_clamped)
                 h_new = h_new + iter_vec[None, None, :]
 
-            # ── Core layers ──────────────────────────────────────────────────
+            # ── Core layers ───
             for blk in core_blocks:
-                h_new = blk(h_new, deterministic=deterministic)   # [B, S, d_model]
+                h_new = blk(h_new, deterministic=deterministic)
 
-            # ── No-grad masking for first n_max iterations ────────────────────
-            # step_idx is a traced integer; n_max is a Python int (static).
-            # jnp comparison produces a traced bool — fine for jnp.where.
-            is_nograd = step_idx < n_max                          # scalar bool
+            # ── stop_gradient wraps entire iteration (injection+core) ───
             h_new = jnp.where(is_nograd, jax.lax.stop_gradient(h_new), h_new)
 
-            # ── Per-sequence freeze for finished sequences ─────────────────────
-            # active[b] = True while step_idx < depths[b]
-            # Broadcast mask: [B] → [B, 1, 1]
-            active = (step_idx < depths)[:, None, None]           # [B, 1, 1]
+            # ── Per-sequence freeze ───
+            active = (step_idx < depths)[:, None, None]
             h_next = jnp.where(active, h_new, h_carry)
 
             return h_next, None

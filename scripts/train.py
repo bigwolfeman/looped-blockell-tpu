@@ -72,7 +72,8 @@ def load_config(path: str) -> LoopedBlockELLConfig:
 
 def create_optimizer(cfg: LoopedBlockELLConfig):
     warmup_fn = optax.linear_schedule(0.0, cfg.lr, cfg.warmup_steps)
-    decay_fn = optax.cosine_decay_schedule(cfg.lr, cfg.total_steps - cfg.warmup_steps)
+    # 1M-horizon cosine: never decays to 0 within our run
+    decay_fn = optax.cosine_decay_schedule(cfg.lr, decay_steps=1_000_000, alpha=0.1)
     schedule = optax.join_schedules([warmup_fn, decay_fn], [cfg.warmup_steps])
     return optax.chain(
         optax.clip_by_global_norm(cfg.grad_clip),
@@ -222,9 +223,9 @@ def train(cfg: LoopedBlockELLConfig, args):
             },
         )
 
-    # ─── Jitted train step ───
-    @partial(jax.jit, static_argnums=(4, 5))
-    def train_step(params, opt_state, input_ids, labels, n_max, k_max, depths, step_key, topology):
+    # ─── Jitted forward+backward (returns grads, does NOT apply optimizer) ───
+    @partial(jax.jit, static_argnums=(3, 4))
+    def grad_step(params, input_ids, labels, n_max, k_max, depths, step_key, topology):
         dropout_key = jax.random.fold_in(step_key, 1)
 
         def loss_fn(p):
@@ -232,20 +233,25 @@ def train(cfg: LoopedBlockELLConfig, args):
                 {"params": p, "topology": topology},
                 input_ids=input_ids, labels=labels,
                 depths=depths, n_max=n_max, k_max=k_max,
-                deterministic=False,
-                rngs={"dropout": dropout_key},
+                deterministic=False, use_iter_embed=is_routing,
+                rngs={"dropout": dropout_key, "state": jax.random.fold_in(step_key, 2)},
                 mutable=["topology"],
             )
             if isinstance(out, tuple):
-                result, mutated = out
+                result, _ = out
             else:
                 result = out
             return result["loss"], result
 
         (loss, out), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
+        return loss, grads
+
+    # ─── Jitted optimizer update (separate so CMS goes between) ───
+    @jax.jit
+    def apply_grads(params, opt_state, grads):
         updates, new_opt_state = tx.update(grads, opt_state, params)
         new_params = optax.apply_updates(params, updates)
-        return new_params, new_opt_state, loss, grads
+        return new_params, new_opt_state
 
     # ─── Data ───
     data_iter = get_data_iterator(cfg)
@@ -268,20 +274,29 @@ def train(cfg: LoopedBlockELLConfig, args):
         else:
             plan = sample_fixed(cfg.batch_size, cfg.mean_depth, cfg.bptt_depth)
 
-        # Train step
-        params, opt_state, loss, grads = train_step(
-            params, opt_state, input_ids, labels,
+        # Forward + backward (grads only, optimizer NOT applied yet)
+        loss, grads = grad_step(
+            params, input_ids, labels,
             plan.n_max, plan.k_max, plan.total, step_key, topology
         )
 
-        loss_val = float(loss)
-        ppl = math.exp(min(loss_val, 20.0))
-
-        # ─── CMS scoring: accumulate gradient norms on Block-ELL values ───
-        if cfg.prune_start <= step < cfg.prune_end:
+        # ─── CMS scoring: BETWEEN grad and optimizer update (CRITICAL) ───
+        if step <= cfg.prune_end:
             for path, layer, fc in bell_paths:
                 grad_vals = get_nested(grads, path)
                 cms_states[path] = accumulate_scores(cms_states[path], grad_vals)
+
+        # ─── Apply optimizer ───
+        params, opt_state = apply_grads(params, opt_state, grads)
+
+        # ─── Re-zero dead tiles every step (prevents momentum resurrection) ───
+        for path, layer, fc in bell_paths:
+            alive_4d = cms_states[path].alive_mask[:, :, None, None]
+            old_vals = get_nested(params, path)
+            params = set_nested(params, path, old_vals * alive_4d)
+
+        loss_val = float(loss)
+        ppl = math.exp(min(loss_val, 20.0))
 
         # Phase label
         if is_routing:
@@ -304,16 +319,14 @@ def train(cfg: LoopedBlockELLConfig, args):
             total_killed = 0
 
             for path, layer, fc in bell_paths:
-                old_density = float(get_density(cms_states[path]))
+                old_alive = int(cms_states[path].alive_mask.sum())
 
-                # Prune lowest-scoring tiles
                 cms_states[path], new_col_indices = prune_step(
                     cms_states[path],
                     get_nested(topology, f"{layer}.mlp.{fc}.col_indices"),
                     cfg.prune_frac,
                 )
 
-                # Update topology: col_indices + alive_mask
                 topology = set_nested(
                     topology,
                     f"{layer}.mlp.{fc}.col_indices",
@@ -325,12 +338,8 @@ def train(cfg: LoopedBlockELLConfig, args):
                     cms_states[path].alive_mask,
                 )
 
-                # Zero dead tile values in params
-                alive_4d = cms_states[path].alive_mask[:, :, None, None]
-                old_vals = get_nested(params, path)
-                params = set_nested(params, path, old_vals * alive_4d)
-
-                killed = int((~cms_states[path].alive_mask).sum() - (~cms_states[path].alive_mask).sum())
+                new_alive = int(cms_states[path].alive_mask.sum())
+                total_killed += old_alive - new_alive
 
             # Reset scores after prune
             for path in cms_states:
@@ -340,7 +349,8 @@ def train(cfg: LoopedBlockELLConfig, args):
                 )
 
             avg_density = sum(float(get_density(s)) for s in cms_states.values()) / len(cms_states)
-            print(f"  PRUNE R{prune_round} @ step {step}: density={avg_density:.1%}")
+            print(f"  PRUNE R{prune_round} @ step {step}: killed {total_killed} tiles, "
+                  f"density={avg_density:.1%}")
 
             if args.wandb_run:
                 import wandb
