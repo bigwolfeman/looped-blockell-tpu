@@ -37,7 +37,7 @@ from looped_blockell.opt.cms import (
     prune_step,
     get_density,
 )
-from looped_blockell.opt.compaction import full_compaction_step
+from looped_blockell.opt.compaction import full_compaction, _get_nested, _set_nested
 from looped_blockell.routing import init_lambda
 
 
@@ -144,19 +144,8 @@ def find_block_ell_paths(params, prefix=""):
     return paths
 
 
-def get_nested(d, path):
-    """Get a value from a nested dict by dotted path."""
-    for key in path.split("."):
-        d = d[key]
-    return d
-
-
-def set_nested(d, path, value):
-    """Set a value in a nested dict by dotted path. Returns new dict."""
-    keys = path.split(".")
-    if len(keys) == 1:
-        return {**d, keys[0]: value}
-    return {**d, keys[0]: set_nested(d[keys[0]], ".".join(keys[1:]), value)}
+get_nested = _get_nested
+set_nested = _set_nested
 
 
 # ---------------------------------------------------------------------------
@@ -360,16 +349,33 @@ def train(cfg: LoopedBlockELLConfig, args):
         # ─── Compact + routing transition ───
         if step == cfg.prune_end and not is_routing:
             is_routing = True
-            avg_density = sum(float(get_density(s)) for s in cms_states.values()) / len(cms_states)
-            print(f"\n  {'='*60}")
-            print(f"  COMPACT @ step {step} | density={avg_density:.1%}")
-            print(f"  {'='*60}\n")
 
-            # TODO: Rebuild Block-ELL with K_new < K_old (physically smaller tensors)
-            # TODO: Column reorder for macro-block density
-            # TODO: Rebuild optimizer state for new shapes
-            # TODO: Add router params + iteration embeddings
-            # For now: continue training with zeroed-tile Block-ELL (correct, not yet compact)
+            key, compact_key = jax.random.split(key)
+            params, topology, opt_state, k_active_macros = full_compaction(
+                params, topology, bell_paths, tx, cfg, compact_key
+            )
+
+            # Re-discover paths (shapes changed after compaction)
+            bell_paths = find_block_ell_paths(params)
+
+            # Re-init CMS states for new K
+            cms_states = {}
+            for path, layer, fc in bell_paths:
+                vals = get_nested(params, path)
+                R, K = vals.shape[0], vals.shape[1]
+                cms_states[path] = init_cms_state(R, K)
+
+            # Re-init routing lambdas
+            route_lambdas = {}
+            for path, layer, fc in bell_paths:
+                route_lambdas[path] = init_lambda(cfg.n_clusters)
+
+            if args.wandb_run:
+                import wandb
+                wandb.log({
+                    "compact/step": step,
+                    **{f"compact/k_active_{k}": v for k, v in k_active_macros.items()},
+                }, step=step)
 
         # ─── Logging ───
         if step % 10 == 0:
