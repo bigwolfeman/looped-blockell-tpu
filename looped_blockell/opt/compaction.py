@@ -151,11 +151,15 @@ def column_reorder_all(
         R_fc1 = fc1_vals.shape[0]  # d_ff / B
         C_ff_tiles = R_fc1  # number of d_ff tile-columns = R of fc1
 
+        # Args are intentionally swapped: compute_column_importance's "fc1" args
+        # should be the layer whose col_indices point INTO d_ff (= fc2, since
+        # fc2 has in=d_ff). Its "fc2" args should be the layer whose ROWS are
+        # d_ff features (= fc1, since fc1 has out=d_ff → R=d_ff/B rows).
         importance = compute_column_importance(
-            fc1_alive_mask=fc2_alive,      # fc2's alive tiles reference d_ff columns
-            fc2_alive_mask=fc1_alive,      # fc1's alive tiles ARE d_ff rows
-            fc1_col_indices=fc2_cols,      # fc2 col_indices point into d_ff
-            fc2_col_indices=fc1_cols,      # fc1 col_indices point into d_model (not d_ff)
+            fc1_alive_mask=fc2_alive,
+            fc2_alive_mask=fc1_alive,
+            fc1_col_indices=fc2_cols,
+            fc2_col_indices=fc1_cols,
             C_ff=C_ff_tiles,
         )
         perm = compute_permutation(importance)

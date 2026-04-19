@@ -160,14 +160,16 @@ def score_step(cms_state: CMSState) -> CMSState:
     CMSState  with normalised gradient_scores, incremented block_ages,
     and reset total_score_steps.
     """
+    # Scores accumulate continuously between prune rounds.
+    # score_step normalizes the current window and resets the counter,
+    # but KEEPS the normalized scores — prune_step uses cumulative scores
+    # across all windows since the last prune round for ranking.
     n = jnp.maximum(cms_state.total_score_steps.astype(jnp.float32), 1.0)
-    normalised = cms_state.gradient_scores / n
 
-    # Increment age only for alive tiles
     new_ages = cms_state.block_ages + cms_state.alive_mask.astype(jnp.int32)
 
     return cms_state.replace(
-        gradient_scores=normalised,
+        gradient_scores=cms_state.gradient_scores / n,
         block_ages=new_ages,
         total_score_steps=jnp.array(0, dtype=jnp.int32),
     )

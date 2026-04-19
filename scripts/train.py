@@ -174,8 +174,9 @@ def train(cfg: LoopedBlockELLConfig, args):
     n_max_init = max(0, cfg.mean_depth - bptt)
     k_max_init = min(cfg.mean_depth, bptt)
 
+    key, state_key = jax.random.split(init_key)
     variables = model.init(
-        {"params": init_key},
+        {"params": init_key, "state": state_key},
         input_ids=dummy_ids, depths=dummy_depths,
         n_max=n_max_init, k_max=k_max_init, deterministic=True,
     )
@@ -223,35 +224,37 @@ def train(cfg: LoopedBlockELLConfig, args):
             },
         )
 
-    # ─── Jitted forward+backward (returns grads, does NOT apply optimizer) ───
-    @partial(jax.jit, static_argnums=(3, 4))
-    def grad_step(params, input_ids, labels, n_max, k_max, depths, step_key, topology):
+    # ─── Jitted forward+backward ───
+    # n_max, k_max, use_iter_embed are static (control flow).
+    # Pad n_max/k_max to multiples of 4 to reduce Poisson recompilations.
+    @partial(jax.jit, static_argnums=(3, 4, 8))
+    def grad_step(params, input_ids, labels, n_max, k_max, depths, step_key, topology, use_iter_embed):
         dropout_key = jax.random.fold_in(step_key, 1)
+        state_key = jax.random.fold_in(step_key, 2)
 
         def loss_fn(p):
-            out = model.apply(
+            # topology is read-only here — CMS updates it externally
+            result = model.apply(
                 {"params": p, "topology": topology},
                 input_ids=input_ids, labels=labels,
                 depths=depths, n_max=n_max, k_max=k_max,
-                deterministic=False, use_iter_embed=is_routing,
-                rngs={"dropout": dropout_key, "state": jax.random.fold_in(step_key, 2)},
-                mutable=["topology"],
+                deterministic=False, use_iter_embed=use_iter_embed,
+                rngs={"dropout": dropout_key, "state": state_key},
             )
-            if isinstance(out, tuple):
-                result, _ = out
-            else:
-                result = out
             return result["loss"], result
 
         (loss, out), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
         return loss, grads
 
-    # ─── Jitted optimizer update (separate so CMS goes between) ───
     @jax.jit
     def apply_grads(params, opt_state, grads):
         updates, new_opt_state = tx.update(grads, opt_state, params)
         new_params = optax.apply_updates(params, updates)
         return new_params, new_opt_state
+
+    def _pad_to_multiple(v, m=4):
+        """Pad to next multiple of m to reduce JIT recompilation from Poisson."""
+        return ((v + m - 1) // m) * m
 
     # ─── Data ───
     data_iter = get_data_iterator(cfg)
@@ -275,9 +278,12 @@ def train(cfg: LoopedBlockELLConfig, args):
             plan = sample_fixed(cfg.batch_size, cfg.mean_depth, cfg.bptt_depth)
 
         # Forward + backward (grads only, optimizer NOT applied yet)
+        # Pad n_max/k_max to reduce Poisson recompilations
+        padded_n = _pad_to_multiple(plan.n_max)
+        padded_k = _pad_to_multiple(plan.k_max)
         loss, grads = grad_step(
             params, input_ids, labels,
-            plan.n_max, plan.k_max, plan.total, step_key, topology
+            padded_n, padded_k, plan.total, step_key, topology, is_routing
         )
 
         # ─── CMS scoring: BETWEEN grad and optimizer update (CRITICAL) ───
