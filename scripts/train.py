@@ -98,19 +98,22 @@ def get_data_iterator(cfg: LoopedBlockELLConfig):
     tokenizer = AutoTokenizer.from_pretrained("bigcode/starcoder2-7b", trust_remote_code=True)
     eos_id = tokenizer.eos_token_id
 
-    print("Streaming OpenWebText...")
-    ds = load_dataset("openwebtext", split="train", streaming=True, trust_remote_code=True)
+    print("Streaming Dolma v1.7 (AllenAI)...")
+    ds = load_dataset("allenai/dolma", split="train", streaming=True, trust_remote_code=True)
 
-    TARGET_TOKENS = 200_000_000
+    TARGET_TOKENS = 2_000_000_000  # 2B tokens
     buf = []
     for sample in ds:
-        ids = tokenizer.encode(sample["text"], add_special_tokens=False)
+        text = sample.get("text", "")
+        if not text:
+            continue
+        ids = tokenizer.encode(text, add_special_tokens=False)
         ids.append(eos_id)
         buf.extend(ids)
         if len(buf) >= TARGET_TOKENS:
             break
     buf = np.array(buf[:TARGET_TOKENS], dtype=np.int32)
-    print(f"Token buffer: {len(buf):,} tokens ({len(buf)/1e6:.0f}M)")
+    print(f"Token buffer: {len(buf):,} tokens ({len(buf)/1e9:.1f}B)")
 
     rng = np.random.default_rng(42)
     seq_len = cfg.max_seq_len
