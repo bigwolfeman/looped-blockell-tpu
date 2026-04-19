@@ -1,4 +1,5 @@
-# Small config: d=768, 1+4+1 layers — for Colab TPU
+# Small: 1 TPU node (v6e-8), batch=32
+# ~80M params, 1+4+1 layers, effective depth 34
 model:
   d_model: 768
   n_heads: 12
@@ -23,7 +24,7 @@ training:
   weight_decay: 0.1
   warmup_steps: 2000
   total_steps: 50000
-  batch_size: 8
+  batch_size: 32
   grad_clip: 1.0
 
 pruning:

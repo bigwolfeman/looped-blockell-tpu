@@ -88,41 +88,92 @@ def count_params(params) -> int:
     return sum(p.size for p in jax.tree_util.tree_leaves(params))
 
 
-def get_data_iterator(cfg: LoopedBlockELLConfig):
-    """OpenWebText data iterator with StarCoder2 tokenizer."""
-    import numpy as np
-    from datasets import load_dataset
-    from transformers import AutoTokenizer
+class DolmaStreamingLoader:
+    """Streams Dolma v1.7 with a refillable token buffer.
 
-    print("Loading StarCoder2 tokenizer...")
-    tokenizer = AutoTokenizer.from_pretrained("bigcode/starcoder2-7b", trust_remote_code=True)
-    eos_id = tokenizer.eos_token_id
+    Keeps a fixed-size buffer in RAM. When the read cursor nears the end,
+    refills from the Dolma stream in a background-compatible way. No data
+    repetition — each token is seen at most once per epoch.
+    """
 
-    print("Streaming Dolma v1.7 (AllenAI)...")
-    ds = load_dataset("allenai/dolma", split="train", streaming=True, trust_remote_code=True)
+    def __init__(self, cfg: LoopedBlockELLConfig, buffer_tokens: int = 50_000_000):
+        import numpy as np
+        from datasets import load_dataset
+        from transformers import AutoTokenizer
 
-    TARGET_TOKENS = 2_000_000_000  # 2B tokens
-    buf = []
-    for sample in ds:
-        text = sample.get("text", "")
-        if not text:
-            continue
-        ids = tokenizer.encode(text, add_special_tokens=False)
-        ids.append(eos_id)
-        buf.extend(ids)
-        if len(buf) >= TARGET_TOKENS:
-            break
-    buf = np.array(buf[:TARGET_TOKENS], dtype=np.int32)
-    print(f"Token buffer: {len(buf):,} tokens ({len(buf)/1e9:.1f}B)")
+        self.cfg = cfg
+        self.seq_len = cfg.max_seq_len
+        self.batch_size = cfg.batch_size
+        self.buffer_tokens = buffer_tokens
+        self.rng = np.random.default_rng(42)
 
-    rng = np.random.default_rng(42)
-    seq_len = cfg.max_seq_len
-    while True:
-        starts = rng.integers(0, len(buf) - seq_len - 1, size=cfg.batch_size)
-        seqs = np.stack([buf[s:s + seq_len + 1] for s in starts])
+        print("Loading StarCoder2 tokenizer...")
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            "bigcode/starcoder2-7b", trust_remote_code=True
+        )
+        self.eos_id = self.tokenizer.eos_token_id
+
+        print("Streaming Dolma v1.7 (AllenAI, 3T tokens)...")
+        self.stream = iter(load_dataset(
+            "allenai/dolma", split="train", streaming=True, trust_remote_code=True
+        ))
+
+        self.buf = np.zeros(buffer_tokens, dtype=np.int32)
+        self.buf_len = 0
+        self.total_tokens_streamed = 0
+
+        self._fill_buffer()
+
+    def _fill_buffer(self):
+        """Fill the buffer from the Dolma stream."""
+        import numpy as np
+
+        tokens = []
+        while len(tokens) < self.buffer_tokens:
+            try:
+                sample = next(self.stream)
+            except StopIteration:
+                print("  Dolma stream exhausted (full epoch complete)")
+                break
+            text = sample.get("text", "")
+            if not text:
+                continue
+            ids = self.tokenizer.encode(text, add_special_tokens=False)
+            ids.append(self.eos_id)
+            tokens.extend(ids)
+
+        n = min(len(tokens), self.buffer_tokens)
+        self.buf[:n] = np.array(tokens[:n], dtype=np.int32)
+        self.buf_len = n
+        self.total_tokens_streamed += n
+        print(f"  Buffer filled: {n:,} tokens "
+              f"(total streamed: {self.total_tokens_streamed/1e9:.2f}B)")
+
+    def get_batch(self):
+        """Get one batch of (input_ids, labels). Refills buffer if needed."""
+        import numpy as np
+
+        window = self.seq_len + 1
+        max_start = self.buf_len - window
+
+        if max_start < self.batch_size:
+            self._fill_buffer()
+            max_start = self.buf_len - window
+            if max_start < self.batch_size:
+                raise RuntimeError("Buffer too small for even one batch")
+
+        starts = self.rng.integers(0, max_start, size=self.batch_size)
+        seqs = np.stack([self.buf[s:s + window] for s in starts])
         x = jnp.asarray(seqs[:, :-1])
         y = jnp.asarray(seqs[:, 1:])
-        yield x, y
+        return x, y
+
+
+def get_data_iterator(cfg: LoopedBlockELLConfig):
+    """Streaming Dolma data iterator. Refills buffer from stream as needed."""
+    loader = DolmaStreamingLoader(cfg, buffer_tokens=50_000_000)
+    while True:
+        yield loader.get_batch()
 
 
 # ---------------------------------------------------------------------------
