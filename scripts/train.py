@@ -17,9 +17,12 @@ import yaml
 from functools import partial
 from pathlib import Path
 
+import json
+
 import jax
 import jax.numpy as jnp
 import optax
+import orbax.checkpoint as ocp
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -149,6 +152,33 @@ get_nested = _get_nested
 set_nested = _set_nested
 
 
+def save_checkpoint(path, params, topology, step, cfg):
+    """Save params + topology + metadata to a checkpoint directory."""
+    ckpt_path = Path(path)
+    ckpt_path.mkdir(parents=True, exist_ok=True)
+    checkpointer = ocp.StandardCheckpointer()
+    checkpointer.save(ckpt_path / "params", params)
+    checkpointer.save(ckpt_path / "topology", topology)
+    meta = {"step": step, "d_model": cfg.d_model, "d_ff": cfg.d_ff,
+            "n_core": cfg.n_core, "n_prelude": cfg.n_prelude, "n_coda": cfg.n_coda,
+            "tile_size": cfg.tile_size, "phase": "compact"}
+    with open(ckpt_path / "meta.json", "w") as f:
+        json.dump(meta, f)
+    print(f"  Checkpoint saved: {ckpt_path}")
+
+
+def load_checkpoint(path, params_template, topology_template):
+    """Load params + topology from checkpoint. Returns (params, topology, meta)."""
+    ckpt_path = Path(path)
+    checkpointer = ocp.StandardCheckpointer()
+    params = checkpointer.restore(ckpt_path / "params", target=params_template)
+    topology = checkpointer.restore(ckpt_path / "topology", target=topology_template)
+    with open(ckpt_path / "meta.json") as f:
+        meta = json.load(f)
+    print(f"  Checkpoint loaded: {ckpt_path} (step {meta['step']})")
+    return params, topology, meta
+
+
 # ---------------------------------------------------------------------------
 # Training
 # ---------------------------------------------------------------------------
@@ -184,6 +214,22 @@ def train(cfg: LoopedBlockELLConfig, args):
     # Topology state (col_indices, alive_mask) — mutable, updated by CMS
     topology = variables.get("topology", {})
 
+    # ─── Resume from checkpoint (Phase C) ───
+    start_step = 0
+    is_routing = False
+    prune_round = 0
+
+    if args.resume_from or args.phase == "c":
+        resume_path = args.resume_from
+        if not resume_path:
+            raise ValueError("--resume-from required when --phase c")
+        print(f"\n  Resuming from compact checkpoint: {resume_path}")
+        params, topology, meta = load_checkpoint(resume_path, params, topology)
+        start_step = meta["step"]
+        is_routing = True
+        prune_round = n_prune_rounds
+        print(f"  Resuming at step {start_step}, Phase C (routing)")
+
     n_params = count_params(params)
     print(f"Parameters: {n_params:,} ({n_params/1e6:.1f}M)")
 
@@ -204,9 +250,6 @@ def train(cfg: LoopedBlockELLConfig, args):
     # ─── Optimizer ───
     tx = create_optimizer(cfg)
     opt_state = tx.init(params)
-
-    prune_round = 0
-    is_routing = False
 
     # ─── Wandb ───
     if args.wandb_run:
@@ -264,7 +307,7 @@ def train(cfg: LoopedBlockELLConfig, args):
     print(f"{'='*70}\n")
 
     t0 = time.time()
-    for step in range(cfg.total_steps):
+    for step in range(start_step, cfg.total_steps):
         input_ids, labels = next(data_iter)
 
         # Sample depth
@@ -393,6 +436,21 @@ def train(cfg: LoopedBlockELLConfig, args):
                     **{f"compact/k_active_{k}": v for k, v in k_active_macros.items()},
                 }, step=step)
 
+            # Save compact checkpoint
+            compact_path = args.compact_checkpoint or (
+                f"{args.checkpoint_dir}/compact" if args.checkpoint_dir else None
+            )
+            if compact_path:
+                save_checkpoint(compact_path, params, topology, step, cfg)
+
+            # Phase B mode: exit after compaction (multi-node → single-node transition)
+            if args.phase == "b":
+                print(f"\n  Phase B complete. Compact checkpoint: {compact_path}")
+                print("  Exiting for node scaling transition.")
+                if args.wandb_run:
+                    wandb.finish()
+                return
+
         # ─── Logging ───
         if step % 10 == 0:
             elapsed = time.time() - t0
@@ -443,6 +501,11 @@ def main():
     parser.add_argument("--checkpoint-dir", default=None, help="Checkpoint directory")
     parser.add_argument("--save-interval", type=int, default=10000)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--phase", choices=["full", "b", "c"], default="full",
+                        help="full=end-to-end, b=stop after compact, c=resume from compact")
+    parser.add_argument("--resume-from", default=None, help="GCS checkpoint path to resume from")
+    parser.add_argument("--compact-checkpoint", default=None,
+                        help="Where to save compact checkpoint (Phase B exit point)")
     args = parser.parse_args()
     train(load_config(args.config), args)
 
