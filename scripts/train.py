@@ -37,6 +37,8 @@ from looped_blockell.opt.tile_pruning import (
     get_density,
     TileScores,
 )
+from looped_blockell.opt.compaction import full_compaction_step
+from looped_blockell.routing import compute_l1_loss, update_lambda, init_lambda
 
 
 def load_config(path: str) -> LoopedBlockELLConfig:
@@ -82,12 +84,46 @@ def count_params(params) -> int:
     return sum(p.size for p in jax.tree_util.tree_leaves(params))
 
 
-def get_data_iterator(cfg: LoopedBlockELLConfig, key: jax.Array):
-    """Synthetic data for testing. Replace with real data loading."""
+def get_data_iterator(cfg: LoopedBlockELLConfig, key: jax.Array, use_synthetic: bool = False):
+    """Data iterator. Uses OpenWebText + StarCoder2 tokenizer by default."""
+    if use_synthetic:
+        while True:
+            key, subkey = jax.random.split(key)
+            tokens = jax.random.randint(subkey, (cfg.batch_size, cfg.max_seq_len + 1), 0, cfg.vocab_size)
+            yield tokens[:, :-1], tokens[:, 1:]
+        return
+
+    import numpy as np
+    from datasets import load_dataset
+    from transformers import AutoTokenizer
+
+    print("Loading StarCoder2 tokenizer...")
+    tokenizer = AutoTokenizer.from_pretrained("bigcode/starcoder2-7b", trust_remote_code=True)
+    eos_id = tokenizer.eos_token_id
+
+    print("Streaming OpenWebText...")
+    ds = load_dataset("openwebtext", split="train", streaming=True, trust_remote_code=True)
+
+    # Build token buffer (200M tokens)
+    TARGET_TOKENS = 200_000_000
+    buf = []
+    for sample in ds:
+        ids = tokenizer.encode(sample["text"], add_special_tokens=False)
+        ids.append(eos_id)
+        buf.extend(ids)
+        if len(buf) >= TARGET_TOKENS:
+            break
+    buf = np.array(buf[:TARGET_TOKENS], dtype=np.int32)
+    print(f"Token buffer: {len(buf):,} tokens ({len(buf)/1e6:.0f}M)")
+
+    rng = np.random.default_rng(42)
+    seq_len = cfg.max_seq_len
     while True:
-        key, subkey = jax.random.split(key)
-        tokens = jax.random.randint(subkey, (cfg.batch_size, cfg.max_seq_len + 1), 0, cfg.vocab_size)
-        yield tokens[:, :-1], tokens[:, 1:]
+        starts = rng.integers(0, len(buf) - seq_len - 1, size=cfg.batch_size)
+        seqs = np.stack([buf[s:s + seq_len + 1] for s in starts])
+        x = jnp.asarray(seqs[:, :-1])
+        y = jnp.asarray(seqs[:, 1:])
+        yield x, y
 
 
 def train(cfg: LoopedBlockELLConfig, args):
@@ -168,7 +204,7 @@ def train(cfg: LoopedBlockELLConfig, args):
         return new_params, new_opt_state, loss, grads
 
     # ─── Data ───
-    data_iter = get_data_iterator(cfg, data_key)
+    data_iter = get_data_iterator(cfg, data_key, use_synthetic=args.synthetic)
 
     print(f"\n{'='*70}")
     print("Starting training...")
@@ -253,12 +289,35 @@ def train(cfg: LoopedBlockELLConfig, args):
             print(f"\n  {'='*60}")
             print(f"  COMPACT + ROUTE @ step {step}")
             print(f"  Final density: {density:.1%}")
-            print(f"  Switching to Phase C: iteration-aware routing")
+            print(f"  {'='*60}")
+
+            # 1. Physical compaction: masked-dense → Block-ELL + column reorder
+            compact_layers, k_active_macros, compact_stats = full_compaction_step(
+                params, tile_masks, cfg.n_core,
+                tile_size=cfg.tile_size,
+                macro_tile_size=cfg.macro_tile_size,
+            )
+
+            if args.wandb_run:
+                import wandb
+                wandb.log({
+                    "compact/density": compact_stats["density"],
+                    "compact/compression": compact_stats["compression_ratio"],
+                    "compact/params_before": compact_stats["params_before"],
+                    "compact/params_after": compact_stats["params_after"],
+                    **{f"compact/k_active_{k}": v for k, v in k_active_macros.items()},
+                }, step=step)
+
+            # 2. Initialize routing state (lambda for ReMoE L1)
+            route_lambdas = {}
+            for layer_name in compact_layers:
+                route_lambdas[f"{layer_name}/fc1"] = init_lambda(cfg.n_clusters)
+                route_lambdas[f"{layer_name}/fc2"] = init_lambda(cfg.n_clusters)
+
+            print(f"  Routing initialized: {cfg.n_clusters} clusters, "
+                  f"target sparsity {cfg.route_target_sparsity:.0%}")
+            print(f"  Post-compact training: steps {step}→{cfg.total_steps}")
             print(f"  {'='*60}\n")
-            # TODO: Physical compaction (masked-dense → Block-ELL)
-            # TODO: Column reorder for macro-block density
-            # TODO: Add router params to optimizer
-            # TODO: Create iteration embeddings
 
         # ─── Logging ───
         if step % 10 == 0:
@@ -310,6 +369,7 @@ def main():
     parser.add_argument("--checkpoint-dir", default=None, help="Checkpoint directory")
     parser.add_argument("--save-interval", type=int, default=10000)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--synthetic", action="store_true", help="Use synthetic data (for testing)")
     args = parser.parse_args()
     train(load_config(args.config), args)
 

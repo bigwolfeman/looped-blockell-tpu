@@ -10,7 +10,7 @@ class LoopedBlockELLConfig:
     n_heads: int = 12
     d_ff: int = 3072  # typically 4 * d_model
     n_layers: int = 6  # total unique layers
-    vocab_size: int = 50257
+    vocab_size: int = 49152  # StarCoder2 tokenizer
     max_seq_len: int = 1024
 
     # Looping
