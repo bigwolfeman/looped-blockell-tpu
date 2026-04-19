@@ -1,8 +1,10 @@
 """Three-phase training: Loop → Prune (with column reorder) → Route.
 
+Block-ELL from the start (density=1.0 = all tiles active). CMS scores
+gradient norms on Block-ELL values directly. Prune → compact → route.
+
 Usage:
-    python scripts/train.py --config configs/small.yaml
-    python scripts/train.py --config configs/medium.yaml --wandb-run my_run
+    python scripts/train.py --config configs/small.yaml --wandb-run my_run
 """
 
 from __future__ import annotations
@@ -27,18 +29,16 @@ from looped_blockell.looping import (
     sample_depth,
     sample_fixed,
 )
-from looped_blockell.opt.tile_pruning import (
-    create_tile_masks,
-    apply_tile_masks,
-    init_tile_scores,
-    accumulate_tile_scores,
-    normalize_tile_scores,
-    prune_tiles,
+from looped_blockell.opt.cms import (
+    CMSState,
+    init_cms_state,
+    accumulate_scores,
+    score_step,
+    prune_step,
     get_density,
-    TileScores,
 )
 from looped_blockell.opt.compaction import full_compaction_step
-from looped_blockell.routing import compute_l1_loss, update_lambda, init_lambda
+from looped_blockell.routing import init_lambda
 
 
 def load_config(path: str) -> LoopedBlockELLConfig:
@@ -52,7 +52,7 @@ def load_config(path: str) -> LoopedBlockELLConfig:
         d_model=m.get("d_model", 768), n_heads=m.get("n_heads", 12),
         d_ff=m.get("d_ff", 3072), n_layers=m.get("n_layers", 6),
         n_prelude=m.get("n_prelude", 1), n_core=m.get("n_core", 4),
-        n_coda=m.get("n_coda", 1), vocab_size=m.get("vocab_size", 50257),
+        n_coda=m.get("n_coda", 1), vocab_size=m.get("vocab_size", 49152),
         max_seq_len=m.get("max_seq_len", 1024), mean_depth=m.get("mean_depth", 8),
         max_depth=m.get("max_depth", 32), use_poisson=m.get("use_poisson", True),
         init_decay=m.get("init_decay", 0.447), tile_size=m.get("tile_size", 16),
@@ -118,6 +118,51 @@ def get_data_iterator(cfg: LoopedBlockELLConfig):
         yield x, y
 
 
+# ---------------------------------------------------------------------------
+# Block-ELL param path helpers
+# ---------------------------------------------------------------------------
+
+def find_block_ell_paths(params, prefix=""):
+    """Find all Block-ELL 'values' param paths in the params pytree.
+
+    Returns list of (dotted_path, layer_name, fc_name) tuples.
+    E.g. ('core_0.mlp.fc1.values', 'core_0', 'fc1')
+    """
+    paths = []
+    if isinstance(params, dict):
+        for k, v in params.items():
+            full = f"{prefix}.{k}" if prefix else k
+            if k == "values" and isinstance(v, jnp.ndarray) and v.ndim == 4:
+                # Found a Block-ELL values tensor [R, K, B, B]
+                parts = full.split(".")
+                # Extract layer and fc name: e.g. core_0.mlp.fc1.values
+                layer_name = parts[0] if len(parts) >= 3 else prefix
+                fc_name = parts[-2] if len(parts) >= 2 else "unknown"
+                paths.append((full, layer_name, fc_name))
+            else:
+                paths.extend(find_block_ell_paths(v, full))
+    return paths
+
+
+def get_nested(d, path):
+    """Get a value from a nested dict by dotted path."""
+    for key in path.split("."):
+        d = d[key]
+    return d
+
+
+def set_nested(d, path, value):
+    """Set a value in a nested dict by dotted path. Returns new dict."""
+    keys = path.split(".")
+    if len(keys) == 1:
+        return {**d, keys[0]: value}
+    return {**d, keys[0]: set_nested(d[keys[0]], ".".join(keys[1:]), value)}
+
+
+# ---------------------------------------------------------------------------
+# Training
+# ---------------------------------------------------------------------------
+
 def train(cfg: LoopedBlockELLConfig, args):
     print(f"JAX devices: {jax.devices()}")
     print(f"Config: d={cfg.d_model}, heads={cfg.n_heads}, d_ff={cfg.d_ff}")
@@ -126,7 +171,7 @@ def train(cfg: LoopedBlockELLConfig, args):
 
     n_prune_rounds = max(0, (cfg.prune_end - cfg.prune_start) // cfg.prune_interval)
     final_density = (1 - cfg.prune_frac) ** n_prune_rounds
-    print(f"Pruning: {n_prune_rounds} rounds, {cfg.prune_frac:.0%}/round → {final_density:.1%} target density")
+    print(f"Pruning: {n_prune_rounds} rounds, {cfg.prune_frac:.0%}/round → {final_density:.1%} target")
 
     key = jax.random.PRNGKey(args.seed)
     key, init_key = jax.random.split(key)
@@ -145,16 +190,30 @@ def train(cfg: LoopedBlockELLConfig, args):
         n_max=n_max_init, k_max=k_max_init, deterministic=True,
     )
     params = variables["params"]
+    # Topology state (col_indices, alive_mask) — mutable, updated by CMS
+    topology = variables.get("topology", {})
+
     n_params = count_params(params)
     print(f"Parameters: {n_params:,} ({n_params/1e6:.1f}M)")
+
+    # Find all Block-ELL value paths for CMS scoring
+    bell_paths = find_block_ell_paths(params)
+    print(f"Block-ELL layers: {len(bell_paths)}")
+    for path, layer, fc in bell_paths:
+        shape = get_nested(params, path).shape
+        print(f"  {path}: {shape}")
+
+    # ─── CMS states (one per Block-ELL values tensor) ───
+    cms_states = {}
+    for path, layer, fc in bell_paths:
+        vals = get_nested(params, path)
+        R, K = vals.shape[0], vals.shape[1]
+        cms_states[path] = init_cms_state(R, K)
 
     # ─── Optimizer ───
     tx = create_optimizer(cfg)
     opt_state = tx.init(params)
 
-    # ─── CMS tile masks + scores ───
-    tile_masks = create_tile_masks(cfg.n_core, cfg.d_model, cfg.d_ff, cfg.tile_size)
-    tile_scores = init_tile_scores(cfg.n_core, cfg.d_model, cfg.d_ff, cfg.tile_size)
     prune_round = 0
     is_routing = False
 
@@ -171,24 +230,28 @@ def train(cfg: LoopedBlockELLConfig, args):
                 "n_params": n_params, "lr": cfg.lr, "total_steps": cfg.total_steps,
                 "batch_size": cfg.batch_size, "prune_frac": cfg.prune_frac,
                 "prune_interval": cfg.prune_interval, "target_density": final_density,
-                "tile_size": cfg.tile_size, "macro_tile_size": cfg.macro_tile_size,
             },
         )
 
     # ─── Jitted train step ───
     @partial(jax.jit, static_argnums=(4, 5))
-    def train_step(params, opt_state, input_ids, labels, n_max, k_max, depths, step_key):
+    def train_step(params, opt_state, input_ids, labels, n_max, k_max, depths, step_key, topology):
         dropout_key = jax.random.fold_in(step_key, 1)
 
         def loss_fn(p):
             out = model.apply(
-                {"params": p},
+                {"params": p, "topology": topology},
                 input_ids=input_ids, labels=labels,
                 depths=depths, n_max=n_max, k_max=k_max,
                 deterministic=False,
                 rngs={"dropout": dropout_key},
+                mutable=["topology"],
             )
-            return out["loss"], out
+            if isinstance(out, tuple):
+                result, mutated = out
+            else:
+                result = out
+            return result["loss"], result
 
         (loss, out), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
         updates, new_opt_state = tx.update(grads, opt_state, params)
@@ -206,9 +269,6 @@ def train(cfg: LoopedBlockELLConfig, args):
     for step in range(cfg.total_steps):
         input_ids, labels = next(data_iter)
 
-        # Apply tile masks to params (zero out pruned tiles before forward)
-        masked_params = apply_tile_masks(params, tile_masks, cfg.tile_size)
-
         # Sample depth
         key, depth_key, step_key = jax.random.split(key, 3)
         if cfg.use_poisson:
@@ -219,22 +279,20 @@ def train(cfg: LoopedBlockELLConfig, args):
         else:
             plan = sample_fixed(cfg.batch_size, cfg.mean_depth, cfg.bptt_depth)
 
-        # Train step (on masked params)
-        new_params, opt_state, loss, grads = train_step(
-            masked_params, opt_state, input_ids, labels,
-            plan.n_max, plan.k_max, plan.total, step_key
+        # Train step
+        params, opt_state, loss, grads = train_step(
+            params, opt_state, input_ids, labels,
+            plan.n_max, plan.k_max, plan.total, step_key, topology
         )
-
-        # ─── CMS scoring: accumulate gradient norms (between grad and next step) ───
-        if cfg.prune_start <= step < cfg.prune_end:
-            tile_scores = accumulate_tile_scores(tile_scores, grads, tile_masks, cfg.tile_size)
-
-        # Update params (keep unmasked params for gradient flow on dead tiles)
-        # Re-apply mask to ensure dead tiles stay zero
-        params = apply_tile_masks(new_params, tile_masks, cfg.tile_size)
 
         loss_val = float(loss)
         ppl = math.exp(min(loss_val, 20.0))
+
+        # ─── CMS scoring: accumulate gradient norms on Block-ELL values ───
+        if cfg.prune_start <= step < cfg.prune_end:
+            for path, layer, fc in bell_paths:
+                grad_vals = get_nested(grads, path)
+                cms_states[path] = accumulate_scores(cms_states[path], grad_vals)
 
         # Phase label
         if is_routing:
@@ -244,84 +302,86 @@ def train(cfg: LoopedBlockELLConfig, args):
         else:
             phase = "DENSE"
 
-        # ─── Score normalization every N steps ───
+        # ─── Score normalization ───
         if step > 0 and step % cfg.score_interval == 0:
-            tile_scores = normalize_tile_scores(tile_scores)
+            for path in cms_states:
+                cms_states[path] = score_step(cms_states[path])
 
         # ─── Pruning ───
         if (cfg.prune_start <= step < cfg.prune_end
                 and step > 0
                 and step % cfg.prune_interval == 0):
             prune_round += 1
-            old_density = get_density(tile_masks)
-            tile_masks, n_killed = prune_tiles(tile_masks, tile_scores, cfg.prune_frac)
-            new_density = get_density(tile_masks)
+            total_killed = 0
 
-            # Re-zero dead tiles in params and optimizer state
-            params = apply_tile_masks(params, tile_masks, cfg.tile_size)
+            for path, layer, fc in bell_paths:
+                old_density = float(get_density(cms_states[path]))
+
+                # Prune lowest-scoring tiles
+                cms_states[path], new_col_indices = prune_step(
+                    cms_states[path],
+                    get_nested(topology, f"{layer}.mlp.{fc}.col_indices"),
+                    cfg.prune_frac,
+                )
+
+                # Update topology: col_indices + alive_mask
+                topology = set_nested(
+                    topology,
+                    f"{layer}.mlp.{fc}.col_indices",
+                    new_col_indices,
+                )
+                topology = set_nested(
+                    topology,
+                    f"{layer}.mlp.{fc}.alive_mask",
+                    cms_states[path].alive_mask,
+                )
+
+                # Zero dead tile values in params
+                alive_4d = cms_states[path].alive_mask[:, :, None, None]
+                old_vals = get_nested(params, path)
+                params = set_nested(params, path, old_vals * alive_4d)
+
+                killed = int((~cms_states[path].alive_mask).sum() - (~cms_states[path].alive_mask).sum())
 
             # Reset scores after prune
-            tile_scores = init_tile_scores(cfg.n_core, cfg.d_model, cfg.d_ff, cfg.tile_size)
+            for path in cms_states:
+                cms_states[path] = cms_states[path].replace(
+                    gradient_scores=jnp.zeros_like(cms_states[path].gradient_scores),
+                    total_score_steps=jnp.array(0, dtype=jnp.int32),
+                )
 
-            print(f"  PRUNE R{prune_round} @ step {step}: "
-                  f"killed {n_killed} tiles, {old_density:.1%} → {new_density:.1%} density")
+            avg_density = sum(float(get_density(s)) for s in cms_states.values()) / len(cms_states)
+            print(f"  PRUNE R{prune_round} @ step {step}: density={avg_density:.1%}")
 
             if args.wandb_run:
                 import wandb
-                wandb.log({
-                    "prune/round": prune_round,
-                    "prune/density": new_density,
-                    "prune/tiles_killed": n_killed,
-                }, step=step)
+                wandb.log({"prune/round": prune_round, "prune/density": avg_density}, step=step)
 
         # ─── Compact + routing transition ───
         if step == cfg.prune_end and not is_routing:
             is_routing = True
-            density = get_density(tile_masks)
+            avg_density = sum(float(get_density(s)) for s in cms_states.values()) / len(cms_states)
             print(f"\n  {'='*60}")
-            print(f"  COMPACT + ROUTE @ step {step}")
-            print(f"  Final density: {density:.1%}")
-            print(f"  {'='*60}")
-
-            # 1. Physical compaction: masked-dense → Block-ELL + column reorder
-            compact_layers, k_active_macros, compact_stats = full_compaction_step(
-                params, tile_masks, cfg.n_core,
-                tile_size=cfg.tile_size,
-                macro_tile_size=cfg.macro_tile_size,
-            )
-
-            if args.wandb_run:
-                import wandb
-                wandb.log({
-                    "compact/density": compact_stats["density"],
-                    "compact/compression": compact_stats["compression_ratio"],
-                    "compact/params_before": compact_stats["params_before"],
-                    "compact/params_after": compact_stats["params_after"],
-                    **{f"compact/k_active_{k}": v for k, v in k_active_macros.items()},
-                }, step=step)
-
-            # 2. Initialize routing state (lambda for ReMoE L1)
-            route_lambdas = {}
-            for layer_name in compact_layers:
-                route_lambdas[f"{layer_name}/fc1"] = init_lambda(cfg.n_clusters)
-                route_lambdas[f"{layer_name}/fc2"] = init_lambda(cfg.n_clusters)
-
-            print(f"  Routing initialized: {cfg.n_clusters} clusters, "
-                  f"target sparsity {cfg.route_target_sparsity:.0%}")
-            print(f"  Post-compact training: steps {step}→{cfg.total_steps}")
+            print(f"  COMPACT @ step {step} | density={avg_density:.1%}")
             print(f"  {'='*60}\n")
+
+            # TODO: Rebuild Block-ELL with K_new < K_old (physically smaller tensors)
+            # TODO: Column reorder for macro-block density
+            # TODO: Rebuild optimizer state for new shapes
+            # TODO: Add router params + iteration embeddings
+            # For now: continue training with zeroed-tile Block-ELL (correct, not yet compact)
 
         # ─── Logging ───
         if step % 10 == 0:
             elapsed = time.time() - t0
             sps = (step + 1) / elapsed if elapsed > 0 else 0
             eta_h = (cfg.total_steps - step) / sps / 3600 if sps > 0 else 0
-            density = get_density(tile_masks)
+            avg_density = sum(float(get_density(s)) for s in cms_states.values()) / max(len(cms_states), 1)
 
             print(
                 f"step {step:6d} [{phase:>10s}] | "
                 f"loss {loss_val:.4f} | ppl {ppl:8.2f} | "
-                f"{sps:.1f} step/s | d={density:.2f} | "
+                f"{sps:.1f} step/s | d={avg_density:.2f} | "
                 f"eta {eta_h:.1f}h"
             )
 
@@ -329,8 +389,7 @@ def train(cfg: LoopedBlockELLConfig, args):
                 import wandb
                 wandb.log({
                     "train/loss": loss_val, "train/ppl": ppl,
-                    "train/steps_per_sec": sps,
-                    "train/density": density,
+                    "train/steps_per_sec": sps, "train/density": avg_density,
                     "depth/n_max": plan.n_max, "depth/k_max": plan.k_max,
                 }, step=step)
 
@@ -344,9 +403,10 @@ def train(cfg: LoopedBlockELLConfig, args):
             print(f"  Checkpoint saved: {ckpt_dir}")
 
     elapsed = time.time() - t0
+    avg_density = sum(float(get_density(s)) for s in cms_states.values()) / max(len(cms_states), 1)
     print(f"\n{'='*70}")
     print(f"Training complete: {cfg.total_steps} steps in {elapsed/3600:.1f}h")
-    print(f"Final loss: {loss_val:.4f}, PPL: {ppl:.2f}, density: {get_density(tile_masks):.1%}")
+    print(f"Final loss: {loss_val:.4f}, PPL: {ppl:.2f}, density: {avg_density:.1%}")
     print(f"{'='*70}")
 
     if args.wandb_run:

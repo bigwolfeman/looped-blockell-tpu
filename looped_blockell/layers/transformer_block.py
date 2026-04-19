@@ -13,14 +13,13 @@ from .mlp import MLPBlock
 
 
 class TransformerBlock(nn.Module):
-    """Pre-norm transformer block.
+    """Pre-norm transformer block with Block-ELL MLP.
 
     Architecture:
         x = x + Attention(RMSNorm(x))
         x = x + MLP(RMSNorm(x))
 
-    Args:
-        config: LoopedBlockELLConfig instance.
+    MLP always uses Block-ELL format (density=1.0 = dense-equivalent).
     """
 
     config: Any
@@ -28,7 +27,6 @@ class TransformerBlock(nn.Module):
     @nn.compact
     def __call__(self, x: jnp.ndarray, deterministic: bool = True) -> jnp.ndarray:
         cfg = self.config
-        dtype = jnp.bfloat16
 
         norm1 = RMSNorm(eps=cfg.norm_eps, name="norm_attn")
         attn = MultiHeadAttention(
@@ -36,7 +34,7 @@ class TransformerBlock(nn.Module):
             d_model=cfg.d_model,
             max_seq_len=cfg.max_seq_len,
             dropout=cfg.dropout,
-            dtype=dtype,
+            dtype=jnp.bfloat16,
             name="attention",
         )
         norm2 = RMSNorm(eps=cfg.norm_eps, name="norm_mlp")
@@ -44,10 +42,9 @@ class TransformerBlock(nn.Module):
             d_model=cfg.d_model,
             d_ff=cfg.d_ff,
             dropout=cfg.dropout,
-            use_block_sparse=(cfg.initial_density < 1.0),
             tile_size=cfg.tile_size,
             density=cfg.initial_density,
-            dtype=dtype,
+            dtype=jnp.bfloat16,
             name="mlp",
         )
 
