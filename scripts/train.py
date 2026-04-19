@@ -84,15 +84,8 @@ def count_params(params) -> int:
     return sum(p.size for p in jax.tree_util.tree_leaves(params))
 
 
-def get_data_iterator(cfg: LoopedBlockELLConfig, key: jax.Array, use_synthetic: bool = False):
-    """Data iterator. Uses OpenWebText + StarCoder2 tokenizer by default."""
-    if use_synthetic:
-        while True:
-            key, subkey = jax.random.split(key)
-            tokens = jax.random.randint(subkey, (cfg.batch_size, cfg.max_seq_len + 1), 0, cfg.vocab_size)
-            yield tokens[:, :-1], tokens[:, 1:]
-        return
-
+def get_data_iterator(cfg: LoopedBlockELLConfig):
+    """OpenWebText data iterator with StarCoder2 tokenizer."""
     import numpy as np
     from datasets import load_dataset
     from transformers import AutoTokenizer
@@ -104,7 +97,6 @@ def get_data_iterator(cfg: LoopedBlockELLConfig, key: jax.Array, use_synthetic: 
     print("Streaming OpenWebText...")
     ds = load_dataset("openwebtext", split="train", streaming=True, trust_remote_code=True)
 
-    # Build token buffer (200M tokens)
     TARGET_TOKENS = 200_000_000
     buf = []
     for sample in ds:
@@ -137,7 +129,7 @@ def train(cfg: LoopedBlockELLConfig, args):
     print(f"Pruning: {n_prune_rounds} rounds, {cfg.prune_frac:.0%}/round → {final_density:.1%} target density")
 
     key = jax.random.PRNGKey(args.seed)
-    key, init_key, data_key = jax.random.split(key, 3)
+    key, init_key = jax.random.split(key)
 
     # ─── Model init ───
     model = LoopedTransformer(cfg)
@@ -204,7 +196,7 @@ def train(cfg: LoopedBlockELLConfig, args):
         return new_params, new_opt_state, loss, grads
 
     # ─── Data ───
-    data_iter = get_data_iterator(cfg, data_key, use_synthetic=args.synthetic)
+    data_iter = get_data_iterator(cfg)
 
     print(f"\n{'='*70}")
     print("Starting training...")
@@ -369,7 +361,6 @@ def main():
     parser.add_argument("--checkpoint-dir", default=None, help="Checkpoint directory")
     parser.add_argument("--save-interval", type=int, default=10000)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--synthetic", action="store_true", help="Use synthetic data (for testing)")
     args = parser.parse_args()
     train(load_config(args.config), args)
 
