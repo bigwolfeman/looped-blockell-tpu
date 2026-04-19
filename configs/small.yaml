@@ -1,0 +1,41 @@
+# Small config: d=768, 1+4+1 layers — for Colab TPU
+model:
+  d_model: 768
+  n_heads: 12
+  d_ff: 3072
+  n_layers: 6
+  n_prelude: 1
+  n_core: 4
+  n_coda: 1
+  vocab_size: 50257
+  max_seq_len: 1024
+  mean_depth: 8
+  max_depth: 32
+  use_poisson: true
+  init_decay: 0.447
+  tile_size: 16
+  macro_tile_size: 128
+  tie_weights: true
+  dropout: 0.0
+
+training:
+  lr: 6e-4
+  weight_decay: 0.1
+  warmup_steps: 2000
+  total_steps: 50000
+  batch_size: 8
+  grad_clip: 1.0
+
+pruning:
+  prune_start: 0
+  prune_end: 26000
+  prune_frac: 0.10
+  prune_interval: 2000
+  score_interval: 10
+  topology_interval: 100
+
+routing:
+  n_clusters: 16
+  route_target_sparsity: 0.5
+  route_warmup: 5000
+  route_l1_weight: 0.01

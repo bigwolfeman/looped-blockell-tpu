@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+dist/
+*.egg-info/
+.idea/
+.vscode/
+*.log
+.env*
+wandb/
+checkpoints/
+*.pt
+*.safetensors
+.DS_Store

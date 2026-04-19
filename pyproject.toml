@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "looped-blockell-tpu"
+version = "0.1.0"
+description = "Looped Block-ELL Transformer for TPU — JAX/Flax implementation"
+requires-python = ">=3.10"
+dependencies = [
+    "jax[tpu]>=0.4.30",
+    "flax>=0.10.0",
+    "optax>=0.2.0",
+    "orbax-checkpoint>=0.6.0",
+    "wandb>=0.17.0",
+    "numpy>=1.26.0",
+    "pyyaml>=6.0",
+    "tqdm>=4.66.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-xdist>=3.5",
+]
+colab = [
+    "datasets>=2.20.0",
+    "tiktoken>=0.7.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["looped_blockell*"]
