@@ -89,23 +89,23 @@ def count_params(params) -> int:
 
 
 class DolmaStreamingLoader:
-    """Streams Dolma v1.7 with a refillable token buffer.
+    """Streams Dolma v1.7 sequentially with a refillable token buffer.
 
-    Keeps a fixed-size buffer in RAM. When the read cursor nears the end,
-    refills from the Dolma stream in a background-compatible way. No data
-    repetition — each token is seen at most once per epoch.
+    Every token is seen exactly once. A read cursor advances through the
+    buffer sequentially. When the cursor nears the end, the buffer refills
+    from the Dolma stream. Supports multi-epoch training — restarts the
+    stream when exhausted.
     """
 
-    def __init__(self, cfg: LoopedBlockELLConfig, buffer_tokens: int = 50_000_000):
+    def __init__(self, cfg: LoopedBlockELLConfig, buffer_tokens: int = 50_000_000, n_epochs: int = 1):
         import numpy as np
-        from datasets import load_dataset
         from transformers import AutoTokenizer
 
         self.cfg = cfg
         self.seq_len = cfg.max_seq_len
         self.batch_size = cfg.batch_size
         self.buffer_tokens = buffer_tokens
-        self.rng = np.random.default_rng(42)
+        self.n_epochs = n_epochs
 
         print("Loading StarCoder2 tokenizer...")
         self.tokenizer = AutoTokenizer.from_pretrained(
@@ -113,19 +113,26 @@ class DolmaStreamingLoader:
         )
         self.eos_id = self.tokenizer.eos_token_id
 
-        print("Streaming Dolma v1.7 (AllenAI, 3T tokens)...")
+        self.buf = np.zeros(buffer_tokens, dtype=np.int32)
+        self.buf_len = 0
+        self.cursor = 0
+        self.total_tokens_consumed = 0
+        self.current_epoch = 0
+        self.stream = None
+
+        self._init_stream()
+        self._fill_buffer()
+
+    def _init_stream(self):
+        from datasets import load_dataset
+        self.current_epoch += 1
+        print(f"  Starting Dolma stream (epoch {self.current_epoch}/{self.n_epochs})...")
         self.stream = iter(load_dataset(
             "allenai/dolma", split="train", streaming=True, trust_remote_code=True
         ))
 
-        self.buf = np.zeros(buffer_tokens, dtype=np.int32)
-        self.buf_len = 0
-        self.total_tokens_streamed = 0
-
-        self._fill_buffer()
-
     def _fill_buffer(self):
-        """Fill the buffer from the Dolma stream."""
+        """Refill buffer from Dolma stream. Restarts stream for new epochs."""
         import numpy as np
 
         tokens = []
@@ -133,8 +140,12 @@ class DolmaStreamingLoader:
             try:
                 sample = next(self.stream)
             except StopIteration:
-                print("  Dolma stream exhausted (full epoch complete)")
-                break
+                if self.current_epoch < self.n_epochs:
+                    self._init_stream()
+                    continue
+                else:
+                    print(f"  All {self.n_epochs} epoch(s) complete.")
+                    break
             text = sample.get("text", "")
             if not text:
                 continue
@@ -145,33 +156,42 @@ class DolmaStreamingLoader:
         n = min(len(tokens), self.buffer_tokens)
         self.buf[:n] = np.array(tokens[:n], dtype=np.int32)
         self.buf_len = n
-        self.total_tokens_streamed += n
+        self.cursor = 0
         print(f"  Buffer filled: {n:,} tokens "
-              f"(total streamed: {self.total_tokens_streamed/1e9:.2f}B)")
+              f"(consumed so far: {self.total_tokens_consumed/1e9:.2f}B, "
+              f"epoch {self.current_epoch})")
 
     def get_batch(self):
-        """Get one batch of (input_ids, labels). Refills buffer if needed."""
+        """Get next sequential batch. Every token seen exactly once."""
         import numpy as np
 
         window = self.seq_len + 1
-        max_start = self.buf_len - window
+        stride = self.batch_size * self.seq_len
+        needed = self.cursor + stride + window
 
-        if max_start < self.batch_size:
+        if needed > self.buf_len:
             self._fill_buffer()
-            max_start = self.buf_len - window
-            if max_start < self.batch_size:
-                raise RuntimeError("Buffer too small for even one batch")
+            if self.buf_len < window * self.batch_size:
+                raise RuntimeError("Data exhausted and no more epochs")
 
-        starts = self.rng.integers(0, max_start, size=self.batch_size)
-        seqs = np.stack([self.buf[s:s + window] for s in starts])
+        seqs = []
+        for _ in range(self.batch_size):
+            if self.cursor + window > self.buf_len:
+                self._fill_buffer()
+            seq = self.buf[self.cursor:self.cursor + window]
+            seqs.append(seq)
+            self.cursor += self.seq_len  # advance by seq_len (not window, allows 1-token overlap for labels)
+            self.total_tokens_consumed += self.seq_len
+
+        seqs = np.stack(seqs)
         x = jnp.asarray(seqs[:, :-1])
         y = jnp.asarray(seqs[:, 1:])
         return x, y
 
 
-def get_data_iterator(cfg: LoopedBlockELLConfig):
-    """Streaming Dolma data iterator. Refills buffer from stream as needed."""
-    loader = DolmaStreamingLoader(cfg, buffer_tokens=50_000_000)
+def get_data_iterator(cfg: LoopedBlockELLConfig, n_epochs: int = 1):
+    """Streaming Dolma data iterator. Sequential, no repetition within epoch."""
+    loader = DolmaStreamingLoader(cfg, buffer_tokens=50_000_000, n_epochs=n_epochs)
     while True:
         yield loader.get_batch()
 
@@ -354,7 +374,7 @@ def train(cfg: LoopedBlockELLConfig, args):
         return ((v + m - 1) // m) * m
 
     # ─── Data ───
-    data_iter = get_data_iterator(cfg)
+    data_iter = get_data_iterator(cfg, n_epochs=args.n_epochs)
 
     print(f"\n{'='*70}")
     print("Starting training...")
@@ -560,6 +580,8 @@ def main():
     parser.add_argument("--resume-from", default=None, help="GCS checkpoint path to resume from")
     parser.add_argument("--compact-checkpoint", default=None,
                         help="Where to save compact checkpoint (Phase B exit point)")
+    parser.add_argument("--n-epochs", type=int, default=1,
+                        help="Number of epochs through Dolma (3T tokens per epoch)")
     args = parser.parse_args()
     train(load_config(args.config), args)
 

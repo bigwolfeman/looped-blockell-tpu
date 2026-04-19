@@ -1,0 +1,52 @@
+# Production: 6 TPU nodes → 2 after compact, batch=32
+# Full pretraining: 3 epochs through Dolma (9T tokens seen)
+#
+# Architecture: looped transformer, 3+12+3 layers, core×8 = effective depth 102
+# Train dense on 6 nodes → prune to ~25% → compact → route on 2 nodes
+# With ~40% routing activation + quantization: inference on 1 node
+#
+# Cost model:
+#   Phase B (6 nodes):  ~X hours
+#   Phase C (2 nodes):  ~Y hours
+#   Inference (1 node): live
+model:
+  d_model: 3072
+  n_heads: 24
+  d_ff: 12288  # 4x d_model
+  n_layers: 18
+  n_prelude: 3
+  n_core: 12
+  n_coda: 3
+  vocab_size: 49152  # StarCoder2
+  max_seq_len: 2048
+  mean_depth: 8
+  max_depth: 32
+  use_poisson: true
+  init_decay: 0.447
+  tile_size: 16
+  macro_tile_size: 128
+  tie_weights: true
+  dropout: 0.0
+
+training:
+  lr: 2e-4       # conservative for ~2.5B params
+  weight_decay: 0.1
+  warmup_steps: 4000
+  total_steps: 500000  # 3 epochs × ~167k steps/epoch at batch=32, seq=2048
+  batch_size: 32
+  grad_clip: 1.0
+  n_epochs: 3
+
+pruning:
+  prune_start: 0
+  prune_end: 300000   # prune through first 2 epochs
+  prune_frac: 0.10
+  prune_interval: 23000  # 300k / 13 = ~23k → 13 rounds → 25% density
+  score_interval: 10
+  topology_interval: 100
+
+routing:
+  n_clusters: 32
+  route_target_sparsity: 0.5
+  route_warmup: 10000
+  route_l1_weight: 0.01
