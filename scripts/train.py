@@ -257,6 +257,31 @@ def load_checkpoint(path, params_template, topology_template):
 # Training
 # ---------------------------------------------------------------------------
 
+def _get_injection_stats(params) -> dict:
+    """Extract DiagonalInjection stats from params pytree (call outside jit)."""
+    try:
+        inj = params["injection"]
+        log_A = inj["log_A"]
+        log_dt = inj["log_dt"]
+        A = -jnp.exp(log_A)
+        dt = jax.nn.softplus(log_dt)
+        decay = jnp.exp(dt * A)
+        return {
+            "injection/decay_mean": float(decay.mean()),
+            "injection/spectral_radius": float(jnp.abs(decay).max()),
+            "injection/dt_mean": float(dt.mean()),
+        }
+    except (KeyError, TypeError):
+        return {}
+
+
+def _compute_grad_norm(grads) -> float:
+    """Global gradient L2 norm from grads pytree."""
+    leaves = jax.tree_util.tree_leaves(grads)
+    sq_sum = sum(float(jnp.sum(g.astype(jnp.float32) ** 2)) for g in leaves)
+    return math.sqrt(sq_sum)
+
+
 def train(cfg: LoopedBlockELLConfig, args):
     print(f"JAX devices: {jax.devices()}")
     print(f"Config: d={cfg.d_model}, heads={cfg.n_heads}, d_ff={cfg.d_ff}")
@@ -338,8 +363,53 @@ def train(cfg: LoopedBlockELLConfig, args):
                 "n_params": n_params, "lr": cfg.lr, "total_steps": cfg.total_steps,
                 "batch_size": cfg.batch_size, "prune_frac": cfg.prune_frac,
                 "prune_interval": cfg.prune_interval, "target_density": final_density,
+                "eval_interval": args.eval_interval, "eval_batches": args.eval_batches,
+                "seed": args.seed,
             },
         )
+
+    # ─── Eval data buffer ───
+    # Pre-fill a fixed eval buffer of (args.eval_batches) batches.
+    # These are sampled once from the stream and reused every eval.
+    # We do this after the training loader is created so the cursor is
+    # already advanced; eval tokens come from the *next* stream position.
+    eval_batches_buf = []
+
+    # ─── Jitted forward (eval, no grad) ───
+    @partial(jax.jit, static_argnums=(3, 4, 8))
+    def eval_step(params, input_ids, labels, n_max, k_max, depths, step_key, topology, use_iter_embed):
+        result = model.apply(
+            {"params": params, "topology": topology},
+            input_ids=input_ids, labels=labels,
+            depths=depths, n_max=n_max, k_max=k_max,
+            deterministic=True, use_iter_embed=use_iter_embed,
+            rngs={"dropout": step_key, "state": step_key},
+        )
+        return result["loss"]
+
+    def run_eval(params, topology, key, is_routing_flag):
+        """Evaluate on held-out eval buffer. Returns (val_loss, val_ppl)."""
+        if not eval_batches_buf:
+            return None, None
+        total_loss = 0.0
+        n_batches = 0
+        fixed_depths = jnp.full((cfg.batch_size,), cfg.mean_depth, dtype=jnp.int32)
+        fixed_n = max(0, cfg.mean_depth - cfg.bptt_depth)
+        fixed_k = min(cfg.mean_depth, cfg.bptt_depth)
+        # Pad to multiples of 4 (same policy as training)
+        fixed_n_pad = ((fixed_n + 3) // 4) * 4
+        fixed_k_pad = ((fixed_k + 3) // 4) * 4
+        for x_eval, y_eval in eval_batches_buf:
+            key, ekey = jax.random.split(key)
+            loss = eval_step(
+                params, x_eval, y_eval,
+                fixed_n_pad, fixed_k_pad, fixed_depths, ekey, topology, is_routing_flag
+            )
+            total_loss += float(loss)
+            n_batches += 1
+        val_loss = total_loss / n_batches
+        val_ppl = math.exp(min(val_loss, 20.0))
+        return val_loss, val_ppl
 
     # ─── Jitted forward+backward ───
     # n_max, k_max, use_iter_embed are static (control flow).
@@ -375,6 +445,12 @@ def train(cfg: LoopedBlockELLConfig, args):
 
     # ─── Data ───
     data_iter = get_data_iterator(cfg, n_epochs=args.n_epochs)
+
+    # Fill eval buffer from stream before training starts
+    print(f"Filling eval buffer ({args.eval_batches} batches)...")
+    for _ in range(args.eval_batches):
+        eval_batches_buf.append(next(data_iter))
+    print(f"  Eval buffer ready: {args.eval_batches} × {cfg.batch_size} × {cfg.max_seq_len} tokens")
 
     print(f"\n{'='*70}")
     print("Starting training...")
@@ -472,12 +548,18 @@ def train(cfg: LoopedBlockELLConfig, args):
                 )
 
             avg_density = sum(float(get_density(s)) for s in cms_states.values()) / len(cms_states)
+            total_alive = sum(int(s.alive_mask.sum()) for s in cms_states.values())
             print(f"  PRUNE R{prune_round} @ step {step}: killed {total_killed} tiles, "
-                  f"density={avg_density:.1%}")
+                  f"alive={total_alive}, density={avg_density:.1%}")
 
             if args.wandb_run:
                 import wandb
-                wandb.log({"prune/round": prune_round, "prune/density": avg_density}, step=step)
+                wandb.log({
+                    "prune/round": prune_round,
+                    "prune/density": avg_density,
+                    "prune/tiles_killed": total_killed,
+                    "prune/tiles_alive": total_alive,
+                }, step=step)
 
         # ─── Compact + routing transition ───
         if step == cfg.prune_end and not is_routing:
@@ -500,9 +582,13 @@ def train(cfg: LoopedBlockELLConfig, args):
             old_cms_states = cms_states
             old_bell_paths = bell_paths
 
+            params_before_compact = count_params(old_params)
+            density_before_compact = sum(float(get_density(s)) for s in old_cms_states.values()) / max(len(old_cms_states), 1)
+
             params, topology, opt_state, k_active_macros = full_compaction(
                 old_params, old_topology, old_bell_paths, tx, cfg, compact_key
             )
+            params_after_compact = count_params(params)
 
             # Release all old state — full_compaction already deleted internals;
             # these are the caller-side references that kept them alive.
@@ -534,10 +620,18 @@ def train(cfg: LoopedBlockELLConfig, args):
             for path, layer, fc in bell_paths:
                 route_lambdas[path] = init_lambda(cfg.n_clusters)
 
+            # density after compact: newly init'd cms_states have all tiles alive (density=1.0
+            # for the compacted shapes), so report density relative to original tile count
+            density_after_compact = density_before_compact  # physical density unchanged by compaction
+
             if args.wandb_run:
                 import wandb
                 wandb.log({
                     "compact/step": step,
+                    "compact/density_before": density_before_compact,
+                    "compact/density_after": density_after_compact,
+                    "compact/params_before": params_before_compact,
+                    "compact/params_after": params_after_compact,
                     **{f"compact/k_active_{k}": v for k, v in k_active_macros.items()},
                 }, step=step)
 
@@ -564,21 +658,40 @@ def train(cfg: LoopedBlockELLConfig, args):
             sps = (step + 1) / elapsed if elapsed > 0 else 0
             eta_h = (cfg.total_steps - step) / sps / 3600 if sps > 0 else 0
             avg_density = sum(float(get_density(s)) for s in cms_states.values()) / max(len(cms_states), 1)
+            grad_norm = _compute_grad_norm(grads)
+            depth_total_mean = float(plan.total.mean())
 
             print(
                 f"step {step:6d} [{phase:>10s}] | "
                 f"loss {loss_val:.4f} | ppl {ppl:8.2f} | "
                 f"{sps:.1f} step/s | d={avg_density:.2f} | "
-                f"eta {eta_h:.1f}h"
+                f"|g|={grad_norm:.3f} | eta {eta_h:.1f}h"
             )
 
             if args.wandb_run:
                 import wandb
-                wandb.log({
-                    "train/loss": loss_val, "train/ppl": ppl,
-                    "train/steps_per_sec": sps, "train/density": avg_density,
-                    "depth/n_max": plan.n_max, "depth/k_max": plan.k_max,
-                }, step=step)
+                log_dict = {
+                    "train/loss": loss_val,
+                    "train/ppl": ppl,
+                    "train/steps_per_sec": sps,
+                    "train/density": avg_density,
+                    "train/phase": phase,
+                    "train/grad_norm": grad_norm,
+                    "depth/n_max": plan.n_max,
+                    "depth/k_max": plan.k_max,
+                    "depth/total_mean": depth_total_mean,
+                }
+                log_dict.update(_get_injection_stats(params))
+                wandb.log(log_dict, step=step)
+
+        # ─── Eval ───
+        if args.eval_interval > 0 and step % args.eval_interval == 0 and step > 0:
+            val_loss, val_ppl = run_eval(params, topology, key, is_routing)
+            if val_loss is not None:
+                print(f"  [EVAL] step {step}: val_loss={val_loss:.4f}, val_ppl={val_ppl:.2f}")
+                if args.wandb_run:
+                    import wandb
+                    wandb.log({"val/loss": val_loss, "val/ppl": val_ppl}, step=step)
 
         # ─── Checkpoint ───
         if args.checkpoint_dir and step > 0 and step % args.save_interval == 0:
@@ -615,6 +728,10 @@ def main():
                         help="Where to save compact checkpoint (Phase B exit point)")
     parser.add_argument("--n-epochs", type=int, default=1,
                         help="Number of epochs through Dolma (3T tokens per epoch)")
+    parser.add_argument("--eval-interval", type=int, default=1000,
+                        help="Run evaluation every N steps (0 to disable)")
+    parser.add_argument("--eval-batches", type=int, default=20,
+                        help="Number of batches to use for each eval pass")
     args = parser.parse_args()
     train(load_config(args.config), args)
 
