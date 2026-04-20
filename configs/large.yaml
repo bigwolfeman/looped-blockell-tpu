@@ -29,9 +29,9 @@ training:
 
 pruning:
   prune_start: 0
-  prune_end: 60000
+  prune_end: 69000
   prune_frac: 0.10
-  prune_interval: 4600
+  prune_interval: 5300
   score_interval: 10
   topology_interval: 100
 

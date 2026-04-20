@@ -39,9 +39,9 @@ training:
 
 pruning:
   prune_start: 0
-  prune_end: 300000   # prune through first 2 epochs
+  prune_end: 345000   # prune through first 2 epochs
   prune_frac: 0.10
-  prune_interval: 23000  # 300k / 13 = ~23k → 13 rounds → 25% density
+  prune_interval: 26500  # 300k / 13 = ~23k → 13 rounds → 25% density
   score_interval: 10
   topology_interval: 100
 
