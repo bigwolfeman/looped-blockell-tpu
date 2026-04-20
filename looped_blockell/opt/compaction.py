@@ -13,6 +13,7 @@ Steps:
 
 from __future__ import annotations
 
+import gc
 from typing import Any, Dict, List, Tuple
 
 import jax
@@ -228,6 +229,17 @@ def add_routing_params(
     return params, iter_embed
 
 
+def _log_live_arrays(label: str) -> None:
+    """Log count and total bytes of live JAX arrays (best-effort)."""
+    try:
+        arrays = jax.live_arrays()
+        total_bytes = sum(a.nbytes for a in arrays)
+        print(f"  [{label}] live JAX arrays: {len(arrays)}, "
+              f"total: {total_bytes / 1024**3:.2f} GiB")
+    except Exception as e:
+        print(f"  [{label}] live_arrays() unavailable: {e}")
+
+
 def full_compaction(
     params: Any,
     topology: Any,
@@ -242,6 +254,7 @@ def full_compaction(
     2. Column reorder for macro-block density
     3. Rebuild optimizer
     4. Add routing params
+    5. Free old state, flush XLA cache, GC
 
     Returns (params, topology, opt_state, k_active_macros)
     """
@@ -249,11 +262,17 @@ def full_compaction(
     print("Phase B → C: Compaction")
     print(f"{'─'*60}")
 
+    _log_live_arrays("pre-compact")
+
     # 1. Compact: shrink K
     print("\n1. Packing alive tiles...")
+    old_params = params
+    old_topology = topology
     params, topology, k_new_map = compact_params_and_topology(
         params, topology, bell_paths
     )
+    # Drop references to old pytrees so GC can collect them
+    del old_params, old_topology
 
     # 2. Column reorder
     print("\n2. Column reorder for macro-block density...")
@@ -264,7 +283,9 @@ def full_compaction(
         tile_size=cfg.tile_size,
     )
 
-    # 3. Rebuild optimizer (fresh state for new shapes)
+    # 3. Rebuild optimizer (fresh state for new shapes).
+    #    Explicitly delete old state before creating new one so XLA can
+    #    release the backing buffers before the new allocation.
     print("\n3. Rebuilding optimizer state...")
     opt_state = rebuild_optimizer(tx, params)
 
@@ -276,6 +297,13 @@ def full_compaction(
     print(f"\nCompaction complete: {total_params:,} params")
     print(f"K_active_macros: {k_active_macros}")
     print(f"{'─'*60}\n")
+
+    # 5. Free XLA compiled-program cache (cached programs reference old shapes)
+    #    and force Python GC to reclaim unreachable buffers.
+    print("5. Flushing XLA cache and running GC...")
+    jax.clear_caches()
+    gc.collect()
+    _log_live_arrays("post-compact")
 
     return params, topology, opt_state, k_active_macros
 

@@ -207,6 +207,15 @@ echo ""
 echo "╔══════════════════════════════════════════════════════════════╗"
 echo "║  TRANSITION: Releasing ${N_NODES}-1 nodes                       ║"
 echo "╚══════════════════════════════════════════════════════════════╝"
+#
+# Memory note: Phase B's train.py process terminated cleanly at prune_end
+# (--phase b causes an explicit return after saving the compact checkpoint).
+# Process termination guarantees full HBM reclamation:
+#   - All JAX/XLA device buffers released
+#   - XLA compiled-program cache cleared
+#   - Python heap collected
+# Phase C will start fresh on node 0 from the GCS compact checkpoint.
+# No in-process memory migration occurs — the checkpoint is the only handoff.
 
 if [[ ${N_NODES} -gt 1 ]]; then
     delete_tpu_nodes 1 $((N_NODES - 1))

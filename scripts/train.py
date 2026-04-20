@@ -10,14 +10,14 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import gc
+import json
 import math
 import sys
 import time
 import yaml
 from functools import partial
 from pathlib import Path
-
-import json
 
 import jax
 import jax.numpy as jnp
@@ -483,10 +483,41 @@ def train(cfg: LoopedBlockELLConfig, args):
         if step == cfg.prune_end and not is_routing:
             is_routing = True
 
+            # Multi-host: synchronise all processes before compaction so every
+            # host enters together and sees the same new shapes.
+            n_hosts = jax.process_count()
+            if n_hosts > 1:
+                print(f"  [{jax.process_index()}/{n_hosts}] Waiting for all hosts before compact...")
+                jax.experimental.multihost_utils.sync_global_devices("compact_enter")
+
             key, compact_key = jax.random.split(key)
+
+            # Hold references to old state until full_compaction returns so JAX
+            # doesn't prematurely free backing buffers during the rebuild.
+            old_params    = params
+            old_topology  = topology
+            old_opt_state = opt_state
+            old_cms_states = cms_states
+            old_bell_paths = bell_paths
+
             params, topology, opt_state, k_active_macros = full_compaction(
-                params, topology, bell_paths, tx, cfg, compact_key
+                old_params, old_topology, old_bell_paths, tx, cfg, compact_key
             )
+
+            # Release all old state — full_compaction already deleted internals;
+            # these are the caller-side references that kept them alive.
+            del old_params, old_topology, old_opt_state, old_cms_states, old_bell_paths
+
+            # grad_step / apply_grads were compiled for old shapes.
+            # JAX will retrace on first call with new shapes, but clear the
+            # program cache so old XLA executables don't linger in memory.
+            jax.clear_caches()
+            gc.collect()
+
+            # Multi-host: confirm all hosts finished compaction before continuing.
+            if n_hosts > 1:
+                print(f"  [{jax.process_index()}/{n_hosts}] Compaction done, syncing...")
+                jax.experimental.multihost_utils.sync_global_devices("compact_exit")
 
             # Re-discover paths (shapes changed after compaction)
             bell_paths = find_block_ell_paths(params)
@@ -517,7 +548,9 @@ def train(cfg: LoopedBlockELLConfig, args):
             if compact_path:
                 save_checkpoint(compact_path, params, topology, step, cfg)
 
-            # Phase B mode: exit after compaction (multi-node → single-node transition)
+            # Phase B mode: exit after compaction (multi-node → single-node transition).
+            # Process exit is the cleanest possible memory cleanup — the OS reclaims
+            # everything: XLA buffers, HBM, compiled programs, Python heap.
             if args.phase == "b":
                 print(f"\n  Phase B complete. Compact checkpoint: {compact_path}")
                 print("  Exiting for node scaling transition.")
