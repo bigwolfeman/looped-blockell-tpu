@@ -23,15 +23,15 @@ training:
   lr: 3e-4
   weight_decay: 0.1
   warmup_steps: 2000
-  total_steps: 75000
+  total_steps: 85000
   batch_size: 32
   grad_clip: 1.0
 
 pruning:
   prune_start: 0
-  prune_end: 45000
+  prune_end: 60000
   prune_frac: 0.10
-  prune_interval: 3450
+  prune_interval: 4600
   score_interval: 10
   topology_interval: 100
 
