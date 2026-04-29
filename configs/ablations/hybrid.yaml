@@ -1,0 +1,4 @@
+# Hybrid: half Euclidean + half Lorentz
+model:
+  embed_geometry: hybrid
+  lorentz_dim_fraction: 0.5

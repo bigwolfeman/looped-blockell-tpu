@@ -1,0 +1,3 @@
+# Pure Lorentz hyperbolic embeddings
+model:
+  embed_geometry: lorentz

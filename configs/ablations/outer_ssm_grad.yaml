@@ -1,0 +1,4 @@
+# Outer SSM with gradient flow (cross-sequence BPTT)
+model:
+  use_outer_ssm: true
+  outer_state_detach: false

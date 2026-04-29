@@ -1,0 +1,4 @@
+# Outer SSM with stop_gradient (cross-sequence state, no gradient flow)
+model:
+  use_outer_ssm: true
+  outer_state_detach: true
