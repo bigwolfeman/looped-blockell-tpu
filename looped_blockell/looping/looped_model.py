@@ -55,7 +55,9 @@ import optax
 from ..config import LoopedBlockELLConfig
 from ..layers.norms import RMSNorm
 from ..layers.transformer_block import TransformerBlock
+from ..layers.embeddings import LorentzEmbedding, HybridEmbedding
 from .diagonal_injection import DiagonalInjection
+from .hyper_connections import LoopBoundaryHC, init_streams, collapse_streams
 from .depth_sampler import DepthPlan, sample_depth, sample_fixed
 
 
@@ -78,6 +80,7 @@ class LoopedTransformer(nn.Module):
         labels: Optional[jnp.ndarray] = None,
         deterministic: bool = True,
         use_iter_embed: bool = False,
+        outer_state: Optional[jnp.ndarray] = None,
     ) -> dict:
         """Forward pass.
 
@@ -92,25 +95,47 @@ class LoopedTransformer(nn.Module):
             k_max:        Max grad steps    (Python int)
             labels:       Target token IDs for LM loss   [B, S]  int32 (optional)
             deterministic: If False, apply dropout (training).
+            use_iter_embed: Enable per-iteration embedding (Phase C routing).
+            outer_state:  Cross-sequence latent state     [B, S, d_model] (optional)
+                          h_final from the previous sequence's core loop.
+                          When provided and cfg.use_outer_ssm=True, injected
+                          into the prelude output via a separate diagonal
+                          injection before the core loop begins.
 
         Returns:
             dict with:
                 'logits'     — [B, S, vocab_size]
                 'loss'       — scalar (only when labels is not None)
                 'depth_meta' — dict with t_max, n_max, k_max
+                'outer_state_out' — [B, S, d_model] h_final for next sequence
         """
         cfg = self.config
         total_iters: int = n_max + k_max  # Python int — static for scan
         B, S = input_ids.shape
 
         # ── 1. Embedding ────────────────────────────────────────────────────
-        # We need the embedding weight for weight tying, so keep a handle.
-        embed = nn.Embed(
-            num_embeddings=cfg.vocab_size,
-            features=cfg.d_model,
-            embedding_init=nn.initializers.normal(stddev=0.02),
-            name="embed",
-        )
+        if cfg.embed_geometry == "lorentz":
+            embed = LorentzEmbedding(
+                num_embeddings=cfg.vocab_size,
+                features=cfg.d_model,
+                name="embed",
+            )
+        elif cfg.embed_geometry == "hybrid":
+            lorentz_dim = int(cfg.d_model * cfg.lorentz_dim_fraction)
+            euclidean_dim = cfg.d_model - lorentz_dim
+            embed = HybridEmbedding(
+                num_embeddings=cfg.vocab_size,
+                euclidean_dim=euclidean_dim,
+                lorentz_dim=lorentz_dim,
+                name="embed",
+            )
+        else:
+            embed = nn.Embed(
+                num_embeddings=cfg.vocab_size,
+                features=cfg.d_model,
+                embedding_init=nn.initializers.normal(stddev=0.02),
+                name="embed",
+            )
         x = embed(input_ids)                      # [B, S, d_model]
         x = x * cfg.embedding_scale
 
@@ -120,6 +145,20 @@ class LoopedTransformer(nn.Module):
 
         # ── 3. Input norm (stabilise signal going into injection) ────────────
         e = RMSNorm(cfg.norm_eps, name="input_norm")(x)  # [B, S, d_model]
+
+        # ── 3b. Outer SSM injection (cross-sequence state) ──────────────────
+        # Uses a separate DiagonalInjection so the outer loop has its own
+        # learned decay rates, independent of the inner loop. Stability is
+        # guaranteed by the same Parcae construction: decay ∈ (0,1).
+        if cfg.use_outer_ssm and outer_state is not None:
+            if cfg.outer_state_detach:
+                outer_state = jax.lax.stop_gradient(outer_state)
+            outer_injection = DiagonalInjection(
+                d_model=cfg.d_model,
+                init_decay=cfg.outer_init_decay,
+                name="outer_injection",
+            )
+            e = outer_injection(outer_state, e)
 
         # ── 4. Recurrent state init — truncated normal (Parcae-style) ────────
         h = jax.random.normal(self.make_rng("state"), e.shape, dtype=jnp.float32) * 0.02
@@ -149,78 +188,97 @@ class LoopedTransformer(nn.Module):
             name="iteration_embed",
         )
 
-        # ── 6. lax.scan core loop ─────────────────────────────────────────────
-        # Carry = h  [B, S, d_model]
-        # Scanned = step indices  [total_iters]
+        # ── 6. Core loop (Python for-loop, unrolled by JIT) ──────────────────
+        # We use a Python for-loop instead of lax.scan because:
+        # 1. Flax nn.compact creates params as side effects — incompatible with
+        #    lax.scan + jax.checkpoint (tracer leaks).
+        # 2. On GPU (sm_120), lax.scan + remat creates a massive XLA compilation
+        #    graph that takes 10+ minutes. A Python for-loop compiles faster
+        #    because JIT unrolls it into a flat graph.
+        # 3. Memory: with max_depth <= 12, the unrolled graph is manageable.
+        #    For very deep loops (T>32), lax.scan would be needed — but Parcae
+        #    shows T=8 is optimal, so this isn't a concern.
         #
-        # Per-sequence active mask: active[b] = (step_idx < depths[b])
-        #   → after a sequence hits its budget, h stays frozen.
-        #
-        # No-grad mask: is_nograd = (step_idx < n_max)
-        #   → first n_max iterations run with stop_gradient on the output.
-        #   → last k_max iterations carry full gradients.
-        #
-        # jax.checkpoint on the scan body: recomputes forward activations
-        # during backward instead of storing them — O(1) memory per step.
+        # The loop runs max(n_max + k_max) iterations. Per-sequence depths are
+        # handled via jnp.where masking (frozen sequences waste FLOPs but
+        # produce correct gradients, same as the Parcae paper).
 
-        def scan_body(h_carry, step_idx):
-            is_nograd = step_idx < n_max
+        # Loop-boundary hyper-connections (Hyperloop-style)
+        hc = None
+        streams = None
+        if cfg.use_loop_boundary_hc:
+            hc = LoopBoundaryHC(
+                d_model=cfg.d_model,
+                n_streams=cfg.hc_n_streams,
+                name="loop_hc",
+            )
+            streams = init_streams(h, cfg.hc_n_streams)  # [B, S, n, d]
 
-            # ── Injection ───
-            h_new = injection(h_carry, e)
+        # Force Flax param materialization before jax.checkpoint.
+        _ = injection(h, e)
+        for blk in core_blocks:
+            _ = blk(h, deterministic=deterministic)
+        _ = iter_embed(jnp.array(0))
+        if hc is not None:
+            _ = hc(streams, mode="aggregate")
+            _ = hc(streams, h, mode="distribute")
 
-            # ── Iteration embedding (only during Phase C routing) ───
+        @jax.checkpoint
+        def _loop_body(h_in, t_idx, streams_in):
+            # HC aggregate: mix streams → single input
+            if hc is not None:
+                h_agg = hc(streams_in, mode="aggregate")
+            else:
+                h_agg = h_in
+
+            h_new = injection(h_agg, e)
+
             if use_iter_embed:
-                t_clamped = jnp.minimum(step_idx, cfg.max_depth - 1)
+                t_clamped = jnp.minimum(t_idx, cfg.max_depth - 1)
                 iter_vec = iter_embed(t_clamped)
                 h_new = h_new + iter_vec[None, None, :]
 
-            # ── Core layers ───
             for blk in core_blocks:
                 h_new = blk(h_new, deterministic=deterministic)
 
-            # ── stop_gradient wraps entire iteration (injection+core) ───
+            is_nograd = jnp.array(t_idx) < n_max
             h_new = jnp.where(is_nograd, jax.lax.stop_gradient(h_new), h_new)
 
-            # ── Per-sequence freeze ───
-            active = (step_idx < depths)[:, None, None]
-            h_next = jnp.where(active, h_new, h_carry)
+            active = (jnp.array(t_idx) < depths)[:, None, None]
+            h_out = jnp.where(active, h_new, h_agg)
 
-            return h_next, None
+            # HC distribute: update streams with layer output
+            if hc is not None:
+                active_4d = active[:, :, :, None]
+                streams_out = hc(streams_in, h_new, mode="distribute")
+                streams_out = jnp.where(active_4d, streams_out, streams_in)
+            else:
+                streams_out = None
 
-        # Apply gradient checkpointing to the scan body.
-        # jax.checkpoint (remat) is the correct API for plain functions /
-        # closures — nn.remat is reserved for Flax Module classes.
-        # This makes activation memory O(1) per scan iteration instead of O(T).
-        scan_body_ckpt = jax.checkpoint(scan_body, prevent_cse=False)
+            return h_out, streams_out
 
-        if total_iters > 0:
-            h, _ = jax.lax.scan(
-                scan_body_ckpt,
-                h,
-                jnp.arange(total_iters, dtype=jnp.int32),
-            )
-        # If total_iters == 0 (shouldn't happen in practice), h stays all-zeros.
+        for t in range(total_iters):
+            h, streams = _loop_body(h, t, streams)
 
-        # ── 7. Coda ──────────────────────────────────────────────────────────
+        # Collapse streams back to single hidden state
+        if hc is not None:
+            h = collapse_streams(streams)
+
+        # ── 7. Capture h_final for outer SSM before coda transforms it ────────
+        h_final = h
+
+        # ── 8. Coda ──────────────────────────────────────────────────────────
         x = h
         for i in range(cfg.n_coda):
             x = TransformerBlock(cfg, name=f"coda_{i}")(x, deterministic=deterministic)
 
-        # ── 8. Final norm + LM head ──────────────────────────────────────────
+        # ── 9. Final norm + LM head ──────────────────────────────────────────
         x = RMSNorm(cfg.norm_eps, name="final_norm")(x)           # [B, S, d_model]
-
-        # Weight-tied LM head: logits = x @ embed.T
-        # In Flax, access the embedding kernel via embed.variables is not
-        # available in @nn.compact after the first call. Instead, use
-        # nn.Dense with kernel_init=lambda ...: embed.embedding to share.
-        # The cleanest pattern: call embed.attend() which does exactly x @ W_e.T.
         logits = embed.attend(x)                                  # [B, S, vocab_size]
 
-        # ── 9. Loss ───────────────────────────────────────────────────────────
+        # ── 10. Loss ──────────────────────────────────────────────────────────
         loss = None
         if labels is not None:
-            # Labels are pre-shifted by the data loader (labels[t] = input_ids[t+1])
             loss = optax.softmax_cross_entropy_with_integer_labels(
                 logits.reshape(-1, cfg.vocab_size),
                 labels.reshape(-1),
@@ -229,6 +287,7 @@ class LoopedTransformer(nn.Module):
         return {
             "logits": logits,
             "loss": loss,
+            "outer_state_out": h_final,
             "depth_meta": {
                 "t_max": total_iters,
                 "n_max": n_max,
@@ -285,6 +344,7 @@ def model_fwd(
     labels: Optional[jnp.ndarray] = None,
     deterministic: bool = True,
     mutable: bool = False,
+    outer_state: Optional[jnp.ndarray] = None,
 ) -> dict:
     """Functional forward pass — wraps model.apply with a DepthPlan.
 
@@ -298,9 +358,11 @@ def model_fwd(
         labels:       [B, S] int32 target IDs (optional; enables loss).
         deterministic: Passed through to blocks (dropout control).
         mutable:      If True, return (output, updates) for mutable state.
+        outer_state:  [B, S, d_model] cross-sequence state from prev sequence.
 
     Returns:
         Output dict from LoopedTransformer.__call__.
+        Includes 'outer_state_out' for carrying state to the next sequence.
     """
     call_kwargs = dict(
         input_ids=input_ids,
@@ -309,6 +371,7 @@ def model_fwd(
         k_max=plan.k_max,          # Python int — static
         labels=labels,
         deterministic=deterministic,
+        outer_state=outer_state,
     )
     if mutable:
         return model.apply(params, **call_kwargs, mutable=["block_ell"])

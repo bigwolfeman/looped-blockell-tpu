@@ -615,10 +615,28 @@ def train(cfg: LoopedBlockELLConfig, args):
                 R, K = vals.shape[0], vals.shape[1]
                 cms_states[path] = init_cms_state(R, K)
 
-            # Re-init routing lambdas
+            # Re-init routing lambdas for ReMoE L1 regularisation.
+            # Each Block-ELL layer gets independent per-cluster coefficients.
+            # Lambda updates happen after backward via update_lambda().
             route_lambdas = {}
             for path, layer, fc in bell_paths:
                 route_lambdas[path] = init_lambda(cfg.n_clusters)
+
+            # TODO(P0.5): ReMoE integration requires:
+            # 1. Switch MLPBlock → RoutedMLP in the model (param tree surgery)
+            # 2. Add router params to optimizer (separate group, no weight decay)
+            # 3. In grad_step: pass route_lambdas, get back (loss, l1_loss, gates)
+            # 4. total_loss = task_loss + cfg.route_l1_weight * l1_loss
+            # 5. After backward: route_lambdas = update_lambda(route_lambdas, gates)
+            # 6. Log routing stats: sparsity, entropy, lambda range per cluster
+            #
+            # This requires the model to support a "routed" mode where the MLP
+            # blocks are RoutedMLP instances. The cleanest approach is to have
+            # LoopedTransformer accept a `use_routing=True` flag that swaps the
+            # MLP module class, similar to how use_iter_embed controls iteration
+            # embeddings. The router params would be initialized during compaction
+            # and merged into the params tree.
+            print(f"  Route lambdas initialized ({len(route_lambdas)} layers × {cfg.n_clusters} clusters)")
 
             # density after compact: newly init'd cms_states have all tiles alive (density=1.0
             # for the compacted shapes), so report density relative to original tile count

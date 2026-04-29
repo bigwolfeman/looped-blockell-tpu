@@ -1,0 +1,10 @@
+# Compressed Sparse Attention (DeepSeek-V4 style)
+# Learned token compression (8:1) + Lightning Indexer top-k selection
+model:
+  use_sparse_attention: true
+  sparse_attn_type: csa          # csa (compressed sparse) vs dsa (block-level)
+  csa_compress_ratio: 8
+  csa_compress_stride: 4
+  csa_top_k: 256
+  csa_window_size: 128
+  sparse_attn_n_indexer_heads: 4

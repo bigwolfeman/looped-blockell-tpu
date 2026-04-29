@@ -81,11 +81,17 @@ def load_config(path: str, overlay: str | None = None) -> LoopedBlockELLConfig:
         outer_init_decay=m.get("outer_init_decay", 0.447),
         embed_geometry=m.get("embed_geometry", "euclidean"),
         lorentz_dim_fraction=m.get("lorentz_dim_fraction", 0.5),
+        use_loop_boundary_hc=m.get("use_loop_boundary_hc", False),
+        hc_n_streams=m.get("hc_n_streams", 4),
         use_sparse_attention=m.get("use_sparse_attention", False),
+        sparse_attn_type=m.get("sparse_attn_type", "dsa"),
         sparse_attn_top_k=m.get("sparse_attn_top_k", 256),
         sparse_attn_block_size=m.get("sparse_attn_block_size", 32),
         sparse_attn_n_indexer_heads=m.get("sparse_attn_n_indexer_heads", 4),
-        lr=t.get("lr", 6e-4),
+        csa_compress_ratio=m.get("csa_compress_ratio", 8),
+        csa_compress_stride=m.get("csa_compress_stride", 4),
+        csa_window_size=m.get("csa_window_size", 128),
+        lr=float(t.get("lr", 6e-4)),
         weight_decay=t.get("weight_decay", 0.1),
         warmup_steps=t.get("warmup_steps", 500),
         total_steps=t.get("total_steps", 15000),
@@ -164,7 +170,8 @@ class StreamingLoader:
     def _init_stream(self):
         from datasets import load_dataset
         self.stream = iter(load_dataset(
-            "allenai/dolma", split="train", streaming=True, trust_remote_code=True
+            "HuggingFaceFW/fineweb-edu", name="sample-10BT",
+            split="train", streaming=True,
         ))
 
     def _fill(self):
@@ -237,6 +244,7 @@ def train(cfg: LoopedBlockELLConfig, args):
 
     variables = model.init({"params": k_init, "state": k_state}, **init_kwargs)
     params = variables["params"]
+    topology = variables.get("topology", {})
     n_params = sum(p.size for p in jax.tree_util.tree_leaves(params))
     print(f"Parameters: {n_params:,} ({n_params / 1e6:.1f}M)")
 
@@ -296,8 +304,10 @@ def train(cfg: LoopedBlockELLConfig, args):
         eval_batches.append(loader.get_batch())
 
     # ─── JIT ─────────────────────────────────────────────────────────────
-    @jax.jit
-    def train_step(params, x, y, depths, n_max, k_max, step_key, outer_state_in):
+    from functools import partial
+
+    @partial(jax.jit, static_argnums=(5, 6))
+    def train_step(params, opt_state, x, y, depths, n_max, k_max, step_key, outer_state_in):
         state_key = jax.random.fold_in(step_key, 0)
 
         def loss_fn(p):
@@ -305,7 +315,7 @@ def train(cfg: LoopedBlockELLConfig, args):
                           labels=y, deterministic=False)
             if outer_state_in is not None:
                 kwargs["outer_state"] = outer_state_in
-            out = model.apply({"params": p}, rngs={"state": state_key}, **kwargs)
+            out = model.apply({"params": p, "topology": topology}, rngs={"state": state_key}, **kwargs)
             return out["loss"], out
 
         (loss, out), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
@@ -322,12 +332,17 @@ def train(cfg: LoopedBlockELLConfig, args):
                       labels=y, deterministic=True)
         if outer_state_in is not None:
             kwargs["outer_state"] = outer_state_in
-        out = model.apply({"params": params}, rngs={"state": step_key}, **kwargs)
+        out = model.apply({"params": params, "topology": topology}, rngs={"state": step_key}, **kwargs)
         return out["loss"]
 
     # ─── Train loop ──────────────────────────────────────────────────────
     print(f"\nTraining: steps {start_step}→{cfg.total_steps}")
+    print(f"Compiling first step (max_depth={cfg.max_depth}, may take 1-3 min)...")
+    sys.stdout.flush()
     t0 = time.time()
+
+    # Warmup: compile train_step by running one step, timing it
+    _compile_start = time.time()
 
     for step in range(start_step, cfg.total_steps):
         x, y = loader.get_batch()
@@ -339,8 +354,14 @@ def train(cfg: LoopedBlockELLConfig, args):
         else:
             plan = sample_fixed(cfg.batch_size, cfg.mean_depth, cfg.bptt_depth)
 
+        # Pad n_max/k_max to multiples of 4 to reduce Poisson recompilations
+        def _pad4(v):
+            return ((v + 3) // 4) * 4
+        padded_n = _pad4(plan.n_max)
+        padded_k = _pad4(plan.k_max)
+
         loss, params, opt_state, new_outer = train_step(
-            params, x, y, plan.total, plan.n_max, plan.k_max, step_key,
+            params, opt_state, x, y, plan.total, padded_n, padded_k, step_key,
             outer_state,
         )
 
@@ -350,6 +371,12 @@ def train(cfg: LoopedBlockELLConfig, args):
             else:
                 outer_state = new_outer
 
+        # Report compilation time on first step
+        if step == start_step:
+            _compile_elapsed = time.time() - _compile_start
+            print(f"  ✓ First step compiled in {_compile_elapsed:.1f}s")
+            sys.stdout.flush()
+
         if step % LOG_INTERVAL == 0:
             loss_val = float(loss)
             ppl = math.exp(min(loss_val, 20.0))
@@ -358,6 +385,7 @@ def train(cfg: LoopedBlockELLConfig, args):
             eta_min = (cfg.total_steps - step) / max(sps, 0.01) / 60
             print(f"  step {step:6d} | loss {loss_val:.4f} | ppl {ppl:7.1f} | "
                   f"{sps:.1f} step/s | eta {eta_min:.0f}m")
+            sys.stdout.flush()
             wandb.log({"train/loss": loss_val, "train/ppl": ppl,
                         "perf/steps_per_s": sps}, step=step)
 

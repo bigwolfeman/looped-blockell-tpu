@@ -12,7 +12,8 @@ model:
   vocab_size: 49152
   max_seq_len: 1024
   mean_depth: 6
-  max_depth: 12
+  max_depth: 8
+  use_poisson: true
   use_poisson: true
   init_decay: 0.447
   tile_size: 16
@@ -31,7 +32,7 @@ model:
   sparse_attn_n_indexer_heads: 4
 
 training:
-  lr: 6e-4
+  lr: 0.0006
   weight_decay: 0.1
   warmup_steps: 500
   total_steps: 15000

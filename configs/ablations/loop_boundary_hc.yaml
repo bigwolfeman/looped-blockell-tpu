@@ -1,0 +1,5 @@
+# Loop-boundary hyper-connections (Hyperloop-style)
+# Diagonal parameterization, n=4 streams, applied at loop boundaries only
+model:
+  use_loop_boundary_hc: true
+  hc_n_streams: 4

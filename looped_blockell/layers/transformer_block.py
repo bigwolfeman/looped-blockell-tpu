@@ -9,6 +9,8 @@ import flax.linen as nn
 
 from .norms import RMSNorm
 from .attention import MultiHeadAttention
+from .sparse_attention import DeepSeekSparseAttention
+from .compressed_sparse_attention import CompressedSparseAttention
 from .mlp import MLPBlock
 
 
@@ -20,6 +22,7 @@ class TransformerBlock(nn.Module):
         x = x + MLP(RMSNorm(x))
 
     MLP always uses Block-ELL format (density=1.0 = dense-equivalent).
+    Attention uses standard causal or DeepSeek sparse depending on config.
     """
 
     config: Any
@@ -29,14 +32,39 @@ class TransformerBlock(nn.Module):
         cfg = self.config
 
         norm1 = RMSNorm(eps=cfg.norm_eps, name="norm_attn")
-        attn = MultiHeadAttention(
-            n_heads=cfg.n_heads,
-            d_model=cfg.d_model,
-            max_seq_len=cfg.max_seq_len,
-            dropout=cfg.dropout,
-            dtype=jnp.bfloat16,
-            name="attention",
-        )
+
+        if cfg.use_sparse_attention and cfg.sparse_attn_type == "csa":
+            attn = CompressedSparseAttention(
+                d_model=cfg.d_model,
+                n_heads=cfg.n_heads,
+                max_seq_len=cfg.max_seq_len,
+                compress_ratio=cfg.csa_compress_ratio,
+                compress_stride=cfg.csa_compress_stride,
+                top_k=cfg.sparse_attn_top_k,
+                window_size=cfg.csa_window_size,
+                n_indexer_heads=cfg.sparse_attn_n_indexer_heads,
+                name="attention",
+            )
+        elif cfg.use_sparse_attention:
+            attn = DeepSeekSparseAttention(
+                d_model=cfg.d_model,
+                n_heads=cfg.n_heads,
+                max_seq_len=cfg.max_seq_len,
+                top_k=cfg.sparse_attn_top_k,
+                n_indexer_heads=cfg.sparse_attn_n_indexer_heads,
+                block_size=cfg.sparse_attn_block_size,
+                name="attention",
+            )
+        else:
+            attn = MultiHeadAttention(
+                n_heads=cfg.n_heads,
+                d_model=cfg.d_model,
+                max_seq_len=cfg.max_seq_len,
+                dropout=cfg.dropout,
+                dtype=jnp.bfloat16,
+                name="attention",
+            )
+
         norm2 = RMSNorm(eps=cfg.norm_eps, name="norm_mlp")
         mlp = MLPBlock(
             d_model=cfg.d_model,
