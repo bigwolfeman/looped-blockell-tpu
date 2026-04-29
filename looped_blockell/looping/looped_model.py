@@ -188,45 +188,46 @@ class LoopedTransformer(nn.Module):
             name="iteration_embed",
         )
 
-        # ── 6. Core loop (Python for-loop, unrolled by JIT) ──────────────────
-        # We use a Python for-loop instead of lax.scan because:
-        # 1. Flax nn.compact creates params as side effects — incompatible with
-        #    lax.scan + jax.checkpoint (tracer leaks).
-        # 2. On GPU (sm_120), lax.scan + remat creates a massive XLA compilation
-        #    graph that takes 10+ minutes. A Python for-loop compiles faster
-        #    because JIT unrolls it into a flat graph.
-        # 3. Memory: with max_depth <= 12, the unrolled graph is manageable.
-        #    For very deep loops (T>32), lax.scan would be needed — but Parcae
-        #    shows T=8 is optimal, so this isn't a concern.
+        # ── 6. Core loop via lax.scan ────────────────────────────────────────
+        # lax.scan lets XLA fuse across iterations → 3-5× faster than a Python
+        # for-loop with per-iteration @jax.checkpoint (which creates 120+ tiny
+        # kernel launches at d=512).
         #
-        # The loop runs max(n_max + k_max) iterations. Per-sequence depths are
-        # handled via jnp.where masking (frozen sequences waste FLOPs but
-        # produce correct gradients, same as the Parcae paper).
+        # The forced param materialization below (dummy calls) ensures all Flax
+        # nn.compact params exist BEFORE scan traces the body. This prevents
+        # the tracer leak that originally forced us to use a Python for-loop.
 
         # Loop-boundary hyper-connections (Hyperloop-style)
         hc = None
-        streams = None
-        if cfg.use_loop_boundary_hc:
+        use_hc = cfg.use_loop_boundary_hc
+        if use_hc:
             hc = LoopBoundaryHC(
                 d_model=cfg.d_model,
                 n_streams=cfg.hc_n_streams,
                 name="loop_hc",
             )
-            streams = init_streams(h, cfg.hc_n_streams)  # [B, S, n, d]
 
-        # Force Flax param materialization before jax.checkpoint.
+        # Force Flax param materialization before scan.
         _ = injection(h, e)
         for blk in core_blocks:
             _ = blk(h, deterministic=deterministic)
         _ = iter_embed(jnp.array(0))
-        if hc is not None:
-            _ = hc(streams, mode="aggregate")
-            _ = hc(streams, h, mode="distribute")
+        if use_hc:
+            _dummy_streams = init_streams(h, cfg.hc_n_streams)
+            _ = hc(_dummy_streams, mode="aggregate")
+            _ = hc(_dummy_streams, h, mode="distribute")
 
-        @jax.checkpoint
-        def _loop_body(h_in, t_idx, streams_in):
-            # HC aggregate: mix streams → single input
-            if hc is not None:
+        # Build initial carry for scan
+        if use_hc:
+            streams = init_streams(h, cfg.hc_n_streams)
+        else:
+            # Dummy scalar so carry shape is consistent (scan needs static pytree)
+            streams = jnp.zeros(())
+
+        def _scan_body(carry, step_idx):
+            h_in, streams_in = carry
+
+            if use_hc:
                 h_agg = hc(streams_in, mode="aggregate")
             else:
                 h_agg = h_in
@@ -234,34 +235,39 @@ class LoopedTransformer(nn.Module):
             h_new = injection(h_agg, e)
 
             if use_iter_embed:
-                t_clamped = jnp.minimum(t_idx, cfg.max_depth - 1)
+                t_clamped = jnp.minimum(step_idx, cfg.max_depth - 1)
                 iter_vec = iter_embed(t_clamped)
                 h_new = h_new + iter_vec[None, None, :]
 
             for blk in core_blocks:
                 h_new = blk(h_new, deterministic=deterministic)
 
-            is_nograd = jnp.array(t_idx) < n_max
+            is_nograd = step_idx < n_max
             h_new = jnp.where(is_nograd, jax.lax.stop_gradient(h_new), h_new)
 
-            active = (jnp.array(t_idx) < depths)[:, None, None]
+            active = (step_idx < depths)[:, None, None]
             h_out = jnp.where(active, h_new, h_agg)
 
-            # HC distribute: update streams with layer output
-            if hc is not None:
+            if use_hc:
                 active_4d = active[:, :, :, None]
                 streams_out = hc(streams_in, h_new, mode="distribute")
                 streams_out = jnp.where(active_4d, streams_out, streams_in)
             else:
-                streams_out = None
+                streams_out = streams_in
 
-            return h_out, streams_out
+            return (h_out, streams_out), None
 
-        for t in range(total_iters):
-            h, streams = _loop_body(h, t, streams)
+        if total_iters > 0:
+            (h, streams), _ = jax.lax.scan(
+                jax.checkpoint(
+                    _scan_body,
+                    policy=jax.checkpoint_policies.dots_with_no_batch_dims_saveable,
+                ),
+                (h, streams),
+                jnp.arange(total_iters, dtype=jnp.int32),
+            )
 
-        # Collapse streams back to single hidden state
-        if hc is not None:
+        if use_hc:
             h = collapse_streams(streams)
 
         # ── 7. Capture h_final for outer SSM before coda transforms it ────────

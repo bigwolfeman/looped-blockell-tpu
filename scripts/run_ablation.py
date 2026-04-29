@@ -354,11 +354,12 @@ def train(cfg: LoopedBlockELLConfig, args):
         else:
             plan = sample_fixed(cfg.batch_size, cfg.mean_depth, cfg.bptt_depth)
 
-        # Pad n_max/k_max to multiples of 4 to reduce Poisson recompilations
-        def _pad4(v):
-            return ((v + 3) // 4) * 4
-        padded_n = _pad4(plan.n_max)
-        padded_k = _pad4(plan.k_max)
+        # Fixed padded values: avoids host-device sync from int(jnp.max())
+        # in sample_depth. Worst case for Poisson(6) clamped to [1,8]:
+        # max total=8, bptt=ceil(6/2)=3, so n_max=max(8-3,0)=5→pad=8, k_max=3→pad=4
+        # Using max_depth directly guarantees we cover all Poisson outcomes.
+        padded_n = ((cfg.max_depth - cfg.bptt_depth + 3) // 4) * 4
+        padded_k = ((cfg.bptt_depth + 3) // 4) * 4
 
         loss, params, opt_state, new_outer = train_step(
             params, opt_state, x, y, plan.total, padded_n, padded_k, step_key,
