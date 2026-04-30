@@ -553,6 +553,74 @@ def _depth_attn_fwd_kernel(
 
 
 
+@triton.jit
+def _depth_attn_bwd_kernel(
+    buf_ptr, scale_ptr, query_ptr, weights_ptr, grad_out_ptr,
+    grad_buf_ptr, grad_scale_ptr, grad_query_ptr,
+    N,
+    stride_buf_t, stride_buf_bs, stride_buf_d,
+    stride_go_bs, stride_go_d,
+    stride_scale, stride_query,
+    stride_w_t, stride_w_bs,
+    D: tl.constexpr, BLOCK_D: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    d_offs = tl.arange(0, BLOCK_D)
+    d_mask = d_offs < D
+
+    go = tl.load(grad_out_ptr + pid * stride_go_bs + d_offs * stride_go_d,
+                 mask=d_mask, other=0.0).to(tl.float32)
+    q = tl.load(query_ptr + d_offs * stride_query, mask=d_mask, other=0.0).to(tl.float32)
+    s = tl.load(scale_ptr + d_offs * stride_scale, mask=d_mask, other=1.0).to(tl.float32)
+
+    # First pass: compute dw_t = dot(go, V_t) and go_dot_out = sum_t w_t * dw_t
+    go_dot_out = tl.zeros([], dtype=tl.float32)
+    for t in range(N):
+        w_t = tl.load(weights_ptr + t * stride_w_t + pid * stride_w_bs).to(tl.float32)
+        base = t * stride_buf_t + pid * stride_buf_bs
+        v = tl.load(buf_ptr + base + d_offs * stride_buf_d, mask=d_mask, other=0.0).to(tl.float32)
+        dw_t = tl.sum(go * v)
+        go_dot_out += w_t * dw_t
+
+    # Second pass: compute all gradients
+    dq_acc = tl.zeros([BLOCK_D], dtype=tl.float32)
+    ds_acc = tl.zeros([BLOCK_D], dtype=tl.float32)
+
+    for t in range(N):
+        w_t = tl.load(weights_ptr + t * stride_w_t + pid * stride_w_bs).to(tl.float32)
+        base = t * stride_buf_t + pid * stride_buf_bs
+        v = tl.load(buf_ptr + base + d_offs * stride_buf_d, mask=d_mask, other=0.0).to(tl.float32)
+
+        # d_logit via softmax backward
+        dw_t = tl.sum(go * v)
+        d_logit = w_t * (dw_t - go_dot_out)
+
+        # RMSNorm forward for this entry
+        rms = tl.sqrt(tl.sum(v * v) / D + 1e-6)
+        v_normed = v / rms
+        k = v_normed * s
+
+        # Accumulate d_query and d_scale
+        dq_acc += d_logit * k
+        ds_acc += d_logit * q * v_normed
+
+        # d_V from weighted sum
+        dv_sum = w_t * go
+
+        # d_V through logit → RMSNorm path
+        dk = d_logit * q  # [D]
+        dk_s = dk * s
+        inner = tl.sum(dk_s * v_normed) / D
+        dv_norm = (dk_s - v_normed * inner) / rms
+
+        dv_total = dv_sum + dv_norm
+        tl.store(grad_buf_ptr + base + d_offs * stride_buf_d,
+                 dv_total.to(tl.bfloat16), mask=d_mask)
+
+    tl.atomic_add(grad_query_ptr + d_offs, dq_acc, mask=d_mask)
+    tl.atomic_add(grad_scale_ptr + d_offs, ds_acc, mask=d_mask)
+
+
 class _DepthAttnFn(torch.autograd.Function):
     """Custom autograd for depth attention with Triton forward kernel.
 
@@ -592,60 +660,34 @@ class _DepthAttnFn(torch.autograd.Function):
     def backward(ctx, grad_out):
         values_flat, norm_scale, query, weights = ctx.saved_tensors
         N = ctx.N
-        go = grad_out.float()  # [BS, D]
-        V = values_flat[:N].float()  # [N, BS, D]
-        w = weights  # [N, BS]
-        q = query.float()  # [D]
-        s = norm_scale.float()  # [D]
+        BS, D = grad_out.shape
 
-        # output = sum_t w_t * V_t, so:
-        # d_V_t (from weighted sum) = w_t * go
-        # d_w_t = dot(go, V_t) per (bs) position
-        dw = (go.unsqueeze(0) * V).sum(-1)  # [N, BS]
-
-        # softmax backward: d_logit_t = w_t * (dw_t - sum_j w_j * dw_j)
-        wdw_sum = (w * dw).sum(0, keepdim=True)  # [1, BS]
-        d_logits = w * (dw - wdw_sum)  # [N, BS]
-
-        # logit_t = sum_d (V_t / rms_t * scale * query)_d
-        # d_query from all positions
-        rms = V.pow(2).mean(-1, keepdim=True).add(1e-6).sqrt()  # [N, BS, 1]
-        K = V / rms * s.unsqueeze(0).unsqueeze(0)  # [N, BS, D]
-
-        # d_query = sum over N,BS of: d_logit_t * K_t
-        d_query = (d_logits.unsqueeze(-1) * K).sum(0).sum(0)  # [D]
-
-        # d_scale = sum over N,BS of: d_logit_t * q * V_t / rms_t
-        V_normed = V / rms  # [N, BS, D]
-        d_scale = (d_logits.unsqueeze(-1) * q.unsqueeze(0).unsqueeze(0) * V_normed).sum(0).sum(0)
-
-        # d_V from weighted sum + d_V through RMSNorm(logit path)
-        # d_V from sum: w_t * go
-        dV_sum = w.unsqueeze(-1) * go.unsqueeze(0)  # [N, BS, D]
-
-        # d_V through logit → norm → V:
-        # d_K = d_logit * q
-        dK = d_logits.unsqueeze(-1) * q.unsqueeze(0).unsqueeze(0)  # [N, BS, D]
-        # d_V_normed = dK * scale
-        dV_normed = dK * s.unsqueeze(0).unsqueeze(0)
-        # RMSNorm backward: d_V = (dV_normed - V_normed * mean(dV_normed * V_normed)) / rms
-        inner = (dV_normed * V_normed).mean(-1, keepdim=True)
-        dV_rms = (dV_normed - V_normed * inner) / rms
-
-        dV_total = dV_sum + dV_rms  # [N, BS, D]
-
-        # Pad back to full buffer size
         grad_values = torch.zeros_like(values_flat)
-        grad_values[:N] = dV_total.to(values_flat.dtype)
+        grad_query = torch.zeros(D, device=grad_out.device, dtype=torch.float32)
+        grad_scale = torch.zeros(D, device=grad_out.device, dtype=torch.float32)
 
-        return grad_values, d_scale.to(norm_scale.dtype), d_query.to(query.dtype), None
+        BLOCK_D = triton.next_power_of_2(D)
+        _depth_attn_bwd_kernel[(BS,)](
+            values_flat, norm_scale, query, weights, grad_out,
+            grad_values, grad_scale, grad_query,
+            N,
+            values_flat.stride(0), values_flat.stride(1), values_flat.stride(2),
+            grad_out.stride(0), grad_out.stride(1),
+            norm_scale.stride(0), query.stride(0),
+            weights.stride(0), weights.stride(1),
+            D=D, BLOCK_D=BLOCK_D,
+            num_warps=4, num_stages=1,
+        )
+
+        return grad_values, grad_scale.to(norm_scale.dtype), grad_query.to(query.dtype), None
 
 
 class AttentionResidual(nn.Module):
     """Depth-wise attention over block outputs (arXiv:2603.15031).
 
+    Triton fused forward + analytical backward via custom autograd.Function.
     Zero-init queries for uniform initial attention (paper spec).
-    Cached RMSNorm per entry to avoid redundant recomputation.
+    Single autograd node per call — eliminates graph traversal overhead.
     """
     def __init__(self, d_model: int, max_blocks: int):
         super().__init__()
@@ -653,23 +695,20 @@ class AttentionResidual(nn.Module):
         self.proj = nn.Parameter(torch.zeros(max_blocks, d_model))
         self.norm = RMSNorm(d_model)
         self._entries: list[Tensor] = []
-        self._normed: list[Tensor] = []
 
     def reset(self, B: int = 0, S: int = 0):
         self._entries = []
-        self._normed = []
 
     def append(self, h: Tensor):
         self._entries.append(h)
-        self._normed.append(self.norm(h))
 
     def forward(self, block_idx: int, window: int = 0) -> Tensor:
         n = len(self._entries)
         if n <= 1:
             return self._entries[0]
         w = self.proj[min(block_idx, self.max_blocks - 1)]
-        K = torch.stack(self._normed, dim=0)
-        V = torch.stack(self._entries, dim=0)
+        V = torch.stack(self._entries, dim=0)  # [n, B, S, D]
+        K = self.norm(V)
         logits = torch.einsum("d, nbsd -> nbs", w, K)
         weights = F.softmax(logits, dim=0)
         return torch.einsum("nbs, nbsd -> bsd", weights, V)
