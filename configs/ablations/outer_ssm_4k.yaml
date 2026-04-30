@@ -1,0 +1,7 @@
+# Outer SSM at 4k seq_len — tests if cross-sequence state helps with longer context
+model:
+  max_seq_len: 4096
+  use_outer_ssm: true
+  outer_state_detach: true
+training:
+  batch_size: 2

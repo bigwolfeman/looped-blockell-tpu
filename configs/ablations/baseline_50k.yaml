@@ -1,0 +1,3 @@
+# Euclidean baseline — 50k step long run (reference for hybrid comparison)
+training:
+  total_steps: 50000

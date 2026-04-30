@@ -1,0 +1,4 @@
+# Attention Residuals: depth-wise attention over all block outputs (arXiv:2603.15031)
+# Replaces additive residuals with learned selective aggregation across loop iterations
+model:
+  use_attn_res: true

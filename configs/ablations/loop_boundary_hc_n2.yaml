@@ -1,0 +1,4 @@
+# Loop-boundary HC with n=2 streams (less overhead than n=4)
+model:
+  use_loop_boundary_hc: true
+  hc_n_streams: 2

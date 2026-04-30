@@ -1,0 +1,5 @@
+# Baseline at 2k seq_len — reference for CSA comparison
+model:
+  max_seq_len: 2048
+training:
+  batch_size: 6

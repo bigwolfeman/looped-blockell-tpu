@@ -1,0 +1,5 @@
+# Baseline at 4k seq_len — reference for outer SSM long-sequence test
+model:
+  max_seq_len: 4096
+training:
+  batch_size: 2

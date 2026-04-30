@@ -1,0 +1,12 @@
+# CSA at 2k seq_len — tests compressed sparse attention benefit
+model:
+  max_seq_len: 2048
+  use_sparse_attention: true
+  sparse_attn_type: csa
+  csa_compress_ratio: 8
+  csa_compress_stride: 4
+  csa_window_size: 256
+  sparse_attn_top_k: 64
+  sparse_attn_n_indexer_heads: 4
+training:
+  batch_size: 6

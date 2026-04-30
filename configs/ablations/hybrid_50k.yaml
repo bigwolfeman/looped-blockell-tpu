@@ -1,0 +1,6 @@
+# Hybrid embeddings — 50k step long run
+model:
+  embed_geometry: hybrid
+  lorentz_dim_fraction: 0.5
+training:
+  total_steps: 50000

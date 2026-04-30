@@ -1,0 +1,7 @@
+# No-loop benchmark: T=1 (single pass, no looping overhead)
+model:
+  mean_depth: 1
+  max_depth: 1
+  use_poisson: false
+training:
+  total_steps: 200
