@@ -30,7 +30,7 @@ model:
   memory_alpha_max: 0.003
   memory_surprise_scale: 3.0
   memory_eta_fixed: 0.95
-  use_sigreg: true
+  use_sigreg: false
   sigreg_lambda: 0.02
   use_differentiable_memory: false
 

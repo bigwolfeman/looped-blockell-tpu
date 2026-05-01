@@ -79,7 +79,7 @@ class InteropConfig:
     memory_alpha_max: float = 0.003    # ~74% retained after 100 steps at max surprise
     memory_surprise_scale: float = 3.0
     memory_eta_fixed: float = 0.95
-    use_sigreg: bool = True
+    use_sigreg: bool = False
     sigreg_lambda: float = 0.02
     use_differentiable_memory: bool = False
     memory_append_tokens: int = 8  # N for append mode
