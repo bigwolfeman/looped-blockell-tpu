@@ -272,16 +272,14 @@ def train(cfg: InteropConfig, args):
         mem_params = sum(p.numel() for p in model.neural_memory.memory_mlp.parameters())
         print(f"  Memory MLP: {mem_params:,} ({mem_params / 1e6:.1f}M) — updated via inner loop")
 
-    # Optimizer: separate memory MLP internals (no weight decay, inner-loop managed)
+    # Optimizer: exclude memory MLP (updated exclusively by inner loop)
     if cfg.use_neural_memory:
         mem_mlp_ids = {id(p) for p in model.neural_memory.memory_mlp.parameters()}
         outer_params = [p for p in model.parameters() if id(p) not in mem_mlp_ids and p.requires_grad]
-        mem_mlp_params = [p for p in model.neural_memory.memory_mlp.parameters() if p.requires_grad]
-        param_groups = [
-            {"params": outer_params, "weight_decay": cfg.weight_decay},
-            {"params": mem_mlp_params, "weight_decay": 0.0, "lr": cfg.lr * 0.1},
-        ]
-        optimizer = torch.optim.AdamW(param_groups, lr=cfg.lr, betas=(0.9, 0.95), eps=1e-8)
+        optimizer = torch.optim.AdamW(
+            outer_params, lr=cfg.lr, betas=(0.9, 0.95),
+            weight_decay=cfg.weight_decay, eps=1e-8,
+        )
     else:
         optimizer = torch.optim.AdamW(
             model.parameters(), lr=cfg.lr, betas=(0.9, 0.95),

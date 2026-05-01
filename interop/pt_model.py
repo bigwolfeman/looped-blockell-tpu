@@ -1052,8 +1052,12 @@ class LoopedTransformerPT(nn.Module):
                 labels.reshape(-1),
             )
             loss = task_loss
+            # memory_loss is detached: MLP weights are managed exclusively
+            # by the inner loop. Adding it with gradient causes double-update
+            # (inner loop + outer optimizer) which collapses the MLP.
+            # SIGReg flows through retrieve() → W_Q only (stop-grad on MLP).
             if memory_loss is not None:
-                loss = loss + memory_loss
+                loss = loss + memory_loss.detach()
             if sigreg_val is not None:
                 loss = loss + cfg.sigreg_lambda * sigreg_val
 
