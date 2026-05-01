@@ -600,15 +600,11 @@ def _depth_attn_bwd_kernel(
         v_normed = v / rms
         k = v_normed * s
 
-        # Accumulate d_query and d_scale
         dq_acc += d_logit * k
         ds_acc += d_logit * q * v_normed
 
-        # d_V from weighted sum
         dv_sum = w_t * go
-
-        # d_V through logit → RMSNorm path
-        dk = d_logit * q  # [D]
+        dk = d_logit * q
         dk_s = dk * s
         inner = tl.sum(dk_s * v_normed) / D
         dv_norm = (dk_s - v_normed * inner) / rms
@@ -617,8 +613,11 @@ def _depth_attn_bwd_kernel(
         tl.store(grad_buf_ptr + base + d_offs * stride_buf_d,
                  dv_total.to(tl.bfloat16), mask=d_mask)
 
-    tl.atomic_add(grad_query_ptr + d_offs, dq_acc, mask=d_mask)
-    tl.atomic_add(grad_scale_ptr + d_offs, ds_acc, mask=d_mask)
+    # Write partials to per-program buffers (no atomic contention)
+    tl.store(grad_query_ptr + pid * stride_buf_bs + d_offs * stride_buf_d,
+             dq_acc.to(tl.bfloat16), mask=d_mask)
+    tl.store(grad_scale_ptr + pid * stride_buf_bs + d_offs * stride_buf_d,
+             ds_acc.to(tl.bfloat16), mask=d_mask)
 
 
 class _DepthAttnFn(torch.autograd.Function):
@@ -663,13 +662,14 @@ class _DepthAttnFn(torch.autograd.Function):
         BS, D = grad_out.shape
 
         grad_values = torch.zeros_like(values_flat)
-        grad_query = torch.zeros(D, device=grad_out.device, dtype=torch.float32)
-        grad_scale = torch.zeros(D, device=grad_out.device, dtype=torch.float32)
+        # Partial buffers: each of BS programs writes its local dq/ds [D]
+        grad_query_partial = torch.empty(BS, D, device=grad_out.device, dtype=torch.bfloat16)
+        grad_scale_partial = torch.empty(BS, D, device=grad_out.device, dtype=torch.bfloat16)
 
         BLOCK_D = triton.next_power_of_2(D)
         _depth_attn_bwd_kernel[(BS,)](
             values_flat, norm_scale, query, weights, grad_out,
-            grad_values, grad_scale, grad_query,
+            grad_values, grad_scale_partial, grad_query_partial,
             N,
             values_flat.stride(0), values_flat.stride(1), values_flat.stride(2),
             grad_out.stride(0), grad_out.stride(1),
@@ -678,6 +678,10 @@ class _DepthAttnFn(torch.autograd.Function):
             D=D, BLOCK_D=BLOCK_D,
             num_warps=4, num_stages=1,
         )
+
+        # Reduce partials → [D] (single cuBLAS-level sum, microseconds)
+        grad_query = grad_query_partial.float().sum(0)
+        grad_scale = grad_scale_partial.float().sum(0)
 
         return grad_values, grad_scale.to(norm_scale.dtype), grad_query.to(query.dtype), None
 
