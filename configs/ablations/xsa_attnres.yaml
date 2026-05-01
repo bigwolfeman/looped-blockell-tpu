@@ -1,0 +1,5 @@
+# XSA + Attention Residuals combo
+# XSA forces contextual attention per head, AttnRes learns depth aggregation
+model:
+  use_xsa: true
+  use_attn_res: true

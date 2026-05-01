@@ -34,6 +34,8 @@ class LoopedBlockELLConfig:
     embed_geometry: str = "euclidean"  # euclidean | lorentz | hybrid
     lorentz_dim_fraction: float = 0.5  # fraction of d_model for Lorentz subspace (hybrid only)
 
+    # XSA — Exclusive Self Attention (arXiv:2603.09078)
+    use_xsa: bool = False
     # Attention Residuals (arXiv:2603.15031)
     use_attn_res: bool = False
 

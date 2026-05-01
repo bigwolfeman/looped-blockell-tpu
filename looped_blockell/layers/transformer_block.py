@@ -61,6 +61,7 @@ class TransformerBlock(nn.Module):
                 d_model=cfg.d_model,
                 max_seq_len=cfg.max_seq_len,
                 dropout=cfg.dropout,
+                use_xsa=getattr(cfg, 'use_xsa', False),
                 dtype=jnp.bfloat16,
                 name="attention",
             )

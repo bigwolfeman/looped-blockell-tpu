@@ -49,6 +49,7 @@ class MultiHeadAttention(nn.Module):
     d_model: int
     max_seq_len: int = 1024
     dropout: float = 0.0
+    use_xsa: bool = False
     dtype: jnp.dtype = jnp.bfloat16
 
     @nn.compact
@@ -105,6 +106,12 @@ class MultiHeadAttention(nn.Module):
             attn_weights = nn.Dropout(rate=self.dropout)(attn_weights, deterministic=deterministic)
 
         attn_out = jnp.matmul(attn_weights, v)  # [B, H, S, head_dim]
+
+        # XSA: subtract projection onto own value vector (arXiv:2603.09078)
+        if self.use_xsa:
+            v_norm_sq = jnp.sum(v * v, axis=-1, keepdims=True).clip(min=1e-8)
+            proj = jnp.sum(attn_out * v, axis=-1, keepdims=True) / v_norm_sq
+            attn_out = attn_out - proj * v
 
         # Merge heads
         attn_out = attn_out.transpose(0, 2, 1, 3).reshape(B, S, self.d_model)

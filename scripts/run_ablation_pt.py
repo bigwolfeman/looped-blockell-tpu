@@ -78,6 +78,7 @@ def load_config(path: str, overlay: str | None = None) -> InteropConfig:
         outer_init_decay=m.get("outer_init_decay", 0.447),
         embed_geometry=m.get("embed_geometry", "euclidean"),
         lorentz_dim_fraction=m.get("lorentz_dim_fraction", 0.5),
+        use_xsa=m.get("use_xsa", False),
         use_loop_boundary_hc=m.get("use_loop_boundary_hc", False),
         use_attn_res=m.get("use_attn_res", False),
         attn_res_window=m.get("attn_res_window", 3),

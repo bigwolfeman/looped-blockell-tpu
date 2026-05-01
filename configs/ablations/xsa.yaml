@@ -1,0 +1,4 @@
+# XSA: Exclusive Self Attention (arXiv:2603.09078)
+# Subtracts self-projection from attention output — zero parameters, near-zero cost
+model:
+  use_xsa: true

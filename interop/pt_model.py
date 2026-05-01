@@ -57,6 +57,8 @@ class InteropConfig:
     use_loop_boundary_hc: bool = False
     hc_type: str = "diagonal"  # diagonal | jpmhc
     hc_n_streams: int = 4
+    # XSA — Exclusive Self Attention (arXiv:2603.09078)
+    use_xsa: bool = False
     # Attention Residuals (arXiv:2603.15031)
     use_attn_res: bool = False
     attn_res_window: int = 0  # 0 = full gradient through all entries
@@ -335,6 +337,7 @@ class MultiHeadAttention(nn.Module):
         self.n_heads = cfg.n_heads
         self.d_model = cfg.d_model
         self.head_dim = cfg.head_dim
+        self.use_xsa = cfg.use_xsa
         self.qkv_proj = nn.Linear(cfg.d_model, 3 * cfg.d_model, bias=False)
         self.out_proj = nn.Linear(cfg.d_model, cfg.d_model, bias=False)
         self.register_buffer(
@@ -366,7 +369,14 @@ class MultiHeadAttention(nn.Module):
         if self.dropout > 0.0 and not deterministic:
             attn = F.dropout(attn, p=self.dropout, training=True)
 
-        out = torch.matmul(attn, v)
+        out = torch.matmul(attn, v)  # [B, H, S, d_head]
+
+        # XSA: subtract projection onto own value vector (arXiv:2603.09078)
+        if self.use_xsa:
+            v_norm_sq = (v * v).sum(-1, keepdim=True).clamp(min=1e-8)
+            proj = (out * v).sum(-1, keepdim=True) / v_norm_sq
+            out = out - proj * v
+
         out = out.transpose(1, 2).reshape(B, S, D)
         return self.out_proj(out)
 
