@@ -1022,9 +1022,11 @@ class LoopedTransformerPT(nn.Module):
         memory_loss = None
         sigreg_val = None
         if use_mem:
+            # Detach: inner loop doesn't need outer graph (memory_loss not in outer loss)
+            h_for_mem = h_final.detach()
             for _ in range(cfg.memory_inner_steps):
                 memory_loss = self.neural_memory.update(
-                    h_final, return_stats=False,
+                    h_for_mem, return_stats=False,
                     differentiable=cfg.use_differentiable_memory,
                 )
             if cfg.use_sigreg:
