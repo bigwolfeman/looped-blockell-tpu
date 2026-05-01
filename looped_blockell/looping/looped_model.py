@@ -58,6 +58,7 @@ from ..layers.transformer_block import TransformerBlock
 from ..layers.embeddings import LorentzEmbedding, HybridEmbedding
 from .diagonal_injection import DiagonalInjection
 from .hyper_connections import LoopBoundaryHC, init_streams, collapse_streams
+from .attention_residual import AttentionResidual
 from .depth_sampler import DepthPlan, sample_depth, sample_fixed
 
 
@@ -207,28 +208,53 @@ class LoopedTransformer(nn.Module):
                 name="loop_hc",
             )
 
+        # Attention Residuals (depth-wise attention over block outputs)
+        use_ar = cfg.use_attn_res
+        attn_res = None
+        ar_max_blocks = 1 + cfg.max_depth + 1  # prelude + max_iters + coda
+        if use_ar:
+            attn_res = AttentionResidual(
+                d_model=cfg.d_model,
+                max_blocks=ar_max_blocks,
+                norm_eps=cfg.norm_eps,
+                name="attn_res",
+            )
+
         # Force Flax param materialization before scan.
         _ = injection(h, e)
         for blk in core_blocks:
             _ = blk(h, deterministic=deterministic)
-        _ = iter_embed(jnp.array(0))
+        _ = iter_embed(jnp.array([0]))
         if use_hc:
             _dummy_streams = init_streams(h, cfg.hc_n_streams)
             _ = hc(_dummy_streams, mode="aggregate")
             _ = hc(_dummy_streams, h, mode="distribute")
+        if use_ar:
+            _dummy_buf = jnp.zeros((ar_max_blocks, B, S, cfg.d_model), dtype=h.dtype)
+            _ = attn_res(_dummy_buf, 1, block_idx=0)
 
         # Build initial carry for scan
         if use_hc:
             streams = init_streams(h, cfg.hc_n_streams)
         else:
-            # Dummy scalar so carry shape is consistent (scan needs static pytree)
             streams = jnp.zeros(())
 
+        # AttnRes buffer: prelude output is entry 0
+        if use_ar:
+            ar_buf = jnp.zeros((ar_max_blocks, B, S, cfg.d_model), dtype=h.dtype)
+            ar_buf = ar_buf.at[0].set(x)  # prelude output
+            ar_count = jnp.int32(1)
+        else:
+            ar_buf = jnp.zeros(())
+            ar_count = jnp.int32(0)
+
         def _scan_body(carry, step_idx):
-            h_in, streams_in = carry
+            h_in, streams_in, ar_buf_in, ar_count_in = carry
 
             if use_hc:
                 h_agg = hc(streams_in, mode="aggregate")
+            elif use_ar:
+                h_agg = attn_res(ar_buf_in, ar_count_in, block_idx=ar_count_in)
             else:
                 h_agg = h_in
 
@@ -241,6 +267,15 @@ class LoopedTransformer(nn.Module):
 
             for blk in core_blocks:
                 h_new = blk(h_new, deterministic=deterministic)
+
+            # Append to AttnRes buffer (before detach so values have gradient)
+            if use_ar:
+                write_idx = jnp.minimum(ar_count_in, ar_max_blocks - 1)
+                ar_buf_out = ar_buf_in.at[write_idx].set(h_new)
+                ar_count_out = ar_count_in + 1
+            else:
+                ar_buf_out = ar_buf_in
+                ar_count_out = ar_count_in
 
             is_nograd = step_idx < n_max
             h_new = jnp.where(is_nograd, jax.lax.stop_gradient(h_new), h_new)
@@ -255,15 +290,15 @@ class LoopedTransformer(nn.Module):
             else:
                 streams_out = streams_in
 
-            return (h_out, streams_out), None
+            return (h_out, streams_out, ar_buf_out, ar_count_out), None
 
         if total_iters > 0:
-            (h, streams), _ = jax.lax.scan(
+            (h, streams, ar_buf, ar_count), _ = jax.lax.scan(
                 jax.checkpoint(
                     _scan_body,
                     policy=jax.checkpoint_policies.dots_with_no_batch_dims_saveable,
                 ),
-                (h, streams),
+                (h, streams, ar_buf, ar_count),
                 jnp.arange(total_iters, dtype=jnp.int32),
             )
 
@@ -274,7 +309,10 @@ class LoopedTransformer(nn.Module):
         h_final = h
 
         # ── 8. Coda ──────────────────────────────────────────────────────────
-        x = h
+        if use_ar:
+            x = attn_res(ar_buf, ar_count, block_idx=ar_count)
+        else:
+            x = h
         for i in range(cfg.n_coda):
             x = TransformerBlock(cfg, name=f"coda_{i}")(x, deterministic=deterministic)
 

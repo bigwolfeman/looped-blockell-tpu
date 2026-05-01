@@ -34,6 +34,9 @@ class LoopedBlockELLConfig:
     embed_geometry: str = "euclidean"  # euclidean | lorentz | hybrid
     lorentz_dim_fraction: float = 0.5  # fraction of d_model for Lorentz subspace (hybrid only)
 
+    # Attention Residuals (arXiv:2603.15031)
+    use_attn_res: bool = False
+
     # Loop-boundary hyper-connections (Hyperloop arXiv:2604.21254)
     use_loop_boundary_hc: bool = False
     hc_n_streams: int = 4  # number of parallel residual streams
