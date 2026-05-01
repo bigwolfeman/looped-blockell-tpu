@@ -84,6 +84,8 @@ class InteropConfig:
     use_differentiable_memory: bool = False
     memory_append_tokens: int = 8  # N for append mode
     memory_inner_steps: int = 5    # K inner gradient steps per forward pass
+    memory_warmup_steps: int = 1000  # steps before memory activates
+    memory_ramp_steps: int = 4000    # steps to linearly ramp memory from 0→1
     # CSA attention
     use_sparse_attention: bool = False
     sparse_attn_type: str = "csa"
@@ -913,11 +915,20 @@ class LoopedTransformerPT(nn.Module):
         deterministic: bool = True,
         use_iter_embed: bool = False,
         outer_state: Tensor | None = None,
+        step: int = 0,
     ) -> dict:
         cfg = self.cfg
         total_iters = n_max + k_max
         B, S = input_ids.shape
+
+        # Memory warmup: off for first N steps, linear ramp after
         use_mem = cfg.use_neural_memory
+        mem_scale = 1.0
+        if use_mem:
+            if step < cfg.memory_warmup_steps:
+                use_mem = False
+            elif step < cfg.memory_warmup_steps + cfg.memory_ramp_steps:
+                mem_scale = (step - cfg.memory_warmup_steps) / max(cfg.memory_ramp_steps, 1)
 
         # 1. Embedding
         if self.embed_geometry in ("lorentz", "hybrid"):
@@ -935,6 +946,8 @@ class LoopedTransformerPT(nn.Module):
             mem_out = self.neural_memory.retrieve(x)  # [B, S, d_memory]
             if self.mem_out_proj is not None:
                 mem_out = self.mem_out_proj(mem_out)   # [B, S, d_model]
+            if mem_scale < 1.0:
+                mem_out = mem_out * mem_scale
 
         # AttnRes: record prelude output as block 0
         use_ar = cfg.use_attn_res

@@ -26,6 +26,8 @@ model:
   d_memory: 1024
   memory_theta_lr: 0.01
   memory_inner_steps: 5
+  memory_warmup_steps: 1000   # backbone-only for first 1k steps
+  memory_ramp_steps: 4000     # linear ramp memory 0→1 over steps 1k-5k
   memory_alpha_min: 0.0001
   memory_alpha_max: 0.003
   memory_surprise_scale: 3.0

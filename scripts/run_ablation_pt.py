@@ -107,6 +107,8 @@ def load_config(path: str, overlay: str | None = None) -> InteropConfig:
         use_differentiable_memory=m.get("use_differentiable_memory", False),
         memory_append_tokens=m.get("memory_append_tokens", 8),
         memory_inner_steps=m.get("memory_inner_steps", 5),
+        memory_warmup_steps=m.get("memory_warmup_steps", 1000),
+        memory_ramp_steps=m.get("memory_ramp_steps", 4000),
         lr=float(t.get("lr", 6e-4)),
         weight_decay=t.get("weight_decay", 0.1),
         warmup_steps=t.get("warmup_steps", 500),
@@ -388,6 +390,7 @@ def train(cfg: InteropConfig, args):
                 x, plan.total, plan.n_max, plan.k_max,
                 labels=y, deterministic=False,
                 outer_state=outer_state,
+                step=step,
             )
             loss = out["loss"]
 
