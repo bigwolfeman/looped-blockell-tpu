@@ -106,6 +106,7 @@ def load_config(path: str, overlay: str | None = None) -> InteropConfig:
         sigreg_lambda=float(m.get("sigreg_lambda", 0.02)),
         use_differentiable_memory=m.get("use_differentiable_memory", False),
         memory_append_tokens=m.get("memory_append_tokens", 8),
+        memory_inner_steps=m.get("memory_inner_steps", 5),
         lr=float(t.get("lr", 6e-4)),
         weight_decay=t.get("weight_decay", 0.1),
         warmup_steps=t.get("warmup_steps", 500),

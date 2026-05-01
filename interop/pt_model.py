@@ -74,15 +74,16 @@ class InteropConfig:
     n_memory_layers: int = 6
     d_memory: int = 1024  # hidden dim of memory MLP (~6M params with 6 layers at d=512→1024)
     memory_mode: str = "logit_bias"  # logit_bias | residual | append
-    memory_theta_lr: float = 0.001
-    memory_alpha_min: float = 0.001
-    memory_alpha_max: float = 0.03
+    memory_theta_lr: float = 0.01
+    memory_alpha_min: float = 0.0001
+    memory_alpha_max: float = 0.003    # ~74% retained after 100 steps at max surprise
     memory_surprise_scale: float = 3.0
     memory_eta_fixed: float = 0.95
     use_sigreg: bool = True
     sigreg_lambda: float = 0.02
     use_differentiable_memory: bool = False
     memory_append_tokens: int = 8  # N for append mode
+    memory_inner_steps: int = 5    # K inner gradient steps per forward pass
     # CSA attention
     use_sparse_attention: bool = False
     sparse_attn_type: str = "csa"
@@ -1017,14 +1018,15 @@ class LoopedTransformerPT(nn.Module):
         # 7. Save h_final for outer SSM
         h_final = h
 
-        # 7b. Neural memory: update with what the loop learned
+        # 7b. Neural memory: K inner gradient steps on h_final
         memory_loss = None
         sigreg_val = None
         if use_mem:
-            memory_loss = self.neural_memory.update(
-                h_final, return_stats=False,
-                differentiable=cfg.use_differentiable_memory,
-            )
+            for _ in range(cfg.memory_inner_steps):
+                memory_loss = self.neural_memory.update(
+                    h_final, return_stats=False,
+                    differentiable=cfg.use_differentiable_memory,
+                )
             if cfg.use_sigreg:
                 mem_check = self.neural_memory.retrieve(h_final)
                 sigreg_val = sigreg_loss(mem_check)
@@ -1052,12 +1054,9 @@ class LoopedTransformerPT(nn.Module):
                 labels.reshape(-1),
             )
             loss = task_loss
-            # memory_loss is detached: MLP weights are managed exclusively
-            # by the inner loop. Adding it with gradient causes double-update
-            # (inner loop + outer optimizer) which collapses the MLP.
+            # memory_loss is for logging only — NOT added to outer loss.
+            # MLP weights are managed exclusively by the inner loop.
             # SIGReg flows through retrieve() → W_Q only (stop-grad on MLP).
-            if memory_loss is not None:
-                loss = loss + memory_loss.detach()
             if sigreg_val is not None:
                 loss = loss + cfg.sigreg_lambda * sigreg_val
 

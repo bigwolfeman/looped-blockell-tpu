@@ -24,9 +24,10 @@ model:
   use_neural_memory: true
   n_memory_layers: 6
   d_memory: 1024
-  memory_theta_lr: 0.001
-  memory_alpha_min: 0.001
-  memory_alpha_max: 0.03
+  memory_theta_lr: 0.01
+  memory_inner_steps: 5
+  memory_alpha_min: 0.0001
+  memory_alpha_max: 0.003
   memory_surprise_scale: 3.0
   memory_eta_fixed: 0.95
   use_sigreg: true
