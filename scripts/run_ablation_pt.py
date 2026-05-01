@@ -23,6 +23,7 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import numpy as np
 import torch
+import torch._functorch.config
 import torch.nn.functional as F
 import yaml
 
@@ -92,6 +93,19 @@ def load_config(path: str, overlay: str | None = None) -> InteropConfig:
         csa_compress_ratio=m.get("csa_compress_ratio", 8),
         csa_compress_stride=m.get("csa_compress_stride", 4),
         csa_window_size=m.get("csa_window_size", 128),
+        use_neural_memory=m.get("use_neural_memory", False),
+        n_memory_layers=m.get("n_memory_layers", 6),
+        d_memory=m.get("d_memory", 1024),
+        memory_mode=m.get("memory_mode", "logit_bias"),
+        memory_theta_lr=float(m.get("memory_theta_lr", 0.001)),
+        memory_alpha_min=float(m.get("memory_alpha_min", 0.001)),
+        memory_alpha_max=float(m.get("memory_alpha_max", 0.03)),
+        memory_surprise_scale=float(m.get("memory_surprise_scale", 3.0)),
+        memory_eta_fixed=float(m.get("memory_eta_fixed", 0.95)),
+        use_sigreg=m.get("use_sigreg", True),
+        sigreg_lambda=float(m.get("sigreg_lambda", 0.02)),
+        use_differentiable_memory=m.get("use_differentiable_memory", False),
+        memory_append_tokens=m.get("memory_append_tokens", 8),
         lr=float(t.get("lr", 6e-4)),
         weight_decay=t.get("weight_decay", 0.1),
         warmup_steps=t.get("warmup_steps", 500),
@@ -118,6 +132,7 @@ def save_checkpoint(name: str, step: int, model, optimizer, outer_state=None):
     }
     if outer_state is not None:
         ckpt["outer_state"] = outer_state.detach().cpu()
+    # Memory state is included in model.state_dict() (MLP weights + momentum buffer)
     tmp = d / "ckpt_tmp.pt"
     final = d / "ckpt.pt"
     torch.save(ckpt, tmp)
@@ -253,14 +268,29 @@ def train(cfg: InteropConfig, args):
     n_params = sum(p.numel() for p in model.parameters())
     print(f"Parameters: {n_params:,} ({n_params / 1e6:.1f}M)")
 
-    # Optimizer: AdamW matching optax config
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=cfg.lr,
-        betas=(0.9, 0.95),
-        weight_decay=cfg.weight_decay,
-        eps=1e-8,
-    )
+    if cfg.use_neural_memory:
+        mem_params = sum(p.numel() for p in model.neural_memory.memory_mlp.parameters())
+        print(f"  Memory MLP: {mem_params:,} ({mem_params / 1e6:.1f}M) — updated via inner loop")
+
+    # Optimizer: separate memory MLP internals (no weight decay, inner-loop managed)
+    if cfg.use_neural_memory:
+        mem_mlp_ids = {id(p) for p in model.neural_memory.memory_mlp.parameters()}
+        outer_params = [p for p in model.parameters() if id(p) not in mem_mlp_ids and p.requires_grad]
+        mem_mlp_params = [p for p in model.neural_memory.memory_mlp.parameters() if p.requires_grad]
+        param_groups = [
+            {"params": outer_params, "weight_decay": cfg.weight_decay},
+            {"params": mem_mlp_params, "weight_decay": 0.0, "lr": cfg.lr * 0.1},
+        ]
+        optimizer = torch.optim.AdamW(param_groups, lr=cfg.lr, betas=(0.9, 0.95), eps=1e-8)
+    else:
+        optimizer = torch.optim.AdamW(
+            model.parameters(), lr=cfg.lr, betas=(0.9, 0.95),
+            weight_decay=cfg.weight_decay, eps=1e-8,
+        )
+
+    # Neural memory uses retain_graph=True which conflicts with donated buffers
+    if cfg.use_neural_memory:
+        torch._functorch.config.donated_buffer = False
 
     # torch.compile — use "default" mode (NOT "reduce-overhead" which uses
     # CUDA graphs that reserve ~15GB and cause OOM during eval)
@@ -305,6 +335,13 @@ def train(cfg: InteropConfig, args):
                 "outer_state_detach": cfg.outer_state_detach,
                 "embed_geometry": cfg.embed_geometry,
                 "use_loop_boundary_hc": cfg.use_loop_boundary_hc,
+                "use_neural_memory": cfg.use_neural_memory,
+                "memory_mode": cfg.memory_mode if cfg.use_neural_memory else None,
+                "n_memory_layers": cfg.n_memory_layers if cfg.use_neural_memory else None,
+                "d_memory": cfg.d_memory if cfg.use_neural_memory else None,
+                "use_sigreg": cfg.use_sigreg if cfg.use_neural_memory else None,
+                "use_xsa": cfg.use_xsa,
+                "use_attn_res": cfg.use_attn_res,
                 "framework": "pytorch",
             },
         )
@@ -377,10 +414,23 @@ def train(cfg: InteropConfig, args):
                 print(f"  step {step:6d} | loss {loss_val:.4f} | ppl {ppl:7.1f} | "
                       f"{sps:.1f} step/s | eta {eta_min:.0f}m")
             sys.stdout.flush()
-            wandb.log({
+            log_dict = {
                 "train/loss": loss_val, "train/ppl": ppl,
                 "train/lr": lr, "perf/steps_per_s": sps,
-            }, step=max(step, 1))
+            }
+            # Memory stats
+            if cfg.use_neural_memory:
+                if out.get("memory_loss") is not None:
+                    ml = out["memory_loss"]
+                    log_dict["memory/loss"] = ml.item() if hasattr(ml, 'item') else ml
+                if out.get("sigreg_loss") is not None:
+                    sl = out["sigreg_loss"]
+                    log_dict["memory/sigreg_loss"] = sl.item() if hasattr(sl, 'item') else sl
+                if step % (LOG_INTERVAL * 5) == 0:
+                    mstats = model.neural_memory.get_memory_stats()
+                    for k, v in mstats.items():
+                        log_dict[f"memory/{k}"] = v
+            wandb.log(log_dict, step=max(step, 1))
 
         # Eval
         if step > 0 and step % EVAL_INTERVAL == 0:

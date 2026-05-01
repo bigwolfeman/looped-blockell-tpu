@@ -1,0 +1,6 @@
+# Neural Memory — Append Tokens mode (Titans paper reference)
+# Prepend N memory tokens to KV in attention
+# N extra tokens per layer = O(N*S*d) extra compute
+model:
+  memory_mode: append
+  memory_append_tokens: 8

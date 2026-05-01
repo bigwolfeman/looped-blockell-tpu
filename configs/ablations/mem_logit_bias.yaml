@@ -1,0 +1,5 @@
+# Neural Memory — Attention Logit Bias mode (NOVEL — priority)
+# Memory output shifts Q in attention: q = q + proj(mem_out)
+# Zero-init proj → starts as no-op, backward compatible
+model:
+  memory_mode: logit_bias

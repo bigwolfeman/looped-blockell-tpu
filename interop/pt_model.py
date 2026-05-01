@@ -23,7 +23,9 @@ Matches JAX param tree:
 """
 
 import math
+import sys
 from dataclasses import dataclass
+from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -32,6 +34,11 @@ import triton
 import triton.language as tl
 from torch import Tensor
 from torch.utils.checkpoint import checkpoint
+
+# Add parent repo to path for titans_core imports
+_repo_root = str(Path(__file__).resolve().parent.parent.parent)
+if _repo_root not in sys.path:
+    sys.path.insert(0, _repo_root)
 
 
 @dataclass
@@ -62,6 +69,20 @@ class InteropConfig:
     # Attention Residuals (arXiv:2603.15031)
     use_attn_res: bool = False
     attn_res_window: int = 0  # 0 = full gradient through all entries
+    # Neural Memory (Titans, arXiv:2501.00663)
+    use_neural_memory: bool = False
+    n_memory_layers: int = 6
+    d_memory: int = 1024  # hidden dim of memory MLP (~6M params with 6 layers at d=512→1024)
+    memory_mode: str = "logit_bias"  # logit_bias | residual | append
+    memory_theta_lr: float = 0.001
+    memory_alpha_min: float = 0.001
+    memory_alpha_max: float = 0.03
+    memory_surprise_scale: float = 3.0
+    memory_eta_fixed: float = 0.95
+    use_sigreg: bool = True
+    sigreg_lambda: float = 0.02
+    use_differentiable_memory: bool = False
+    memory_append_tokens: int = 8  # N for append mode
     # CSA attention
     use_sparse_attention: bool = False
     sparse_attn_type: str = "csa"
@@ -256,7 +277,8 @@ class CompressedSparseAttention(nn.Module):
             persistent=False,
         )
 
-    def forward(self, x: Tensor, deterministic: bool = True) -> Tensor:
+    def forward(self, x: Tensor, deterministic: bool = True,
+                memory_bias: Tensor | None = None) -> Tensor:
         B, L, D = x.shape
         hd = self.head_dim
         W = self.window_size
@@ -346,23 +368,63 @@ class MultiHeadAttention(nn.Module):
         )
         self.dropout = cfg.dropout
 
-    def forward(self, x: Tensor, deterministic: bool = True) -> Tensor:
+        self.memory_mode = cfg.memory_mode if cfg.use_neural_memory else None
+
+        # Memory logit bias: zero-init projection so it starts as no-op
+        if cfg.use_neural_memory and cfg.memory_mode == "logit_bias":
+            self.mem_proj = nn.Linear(cfg.d_model, cfg.d_model, bias=False)
+            nn.init.zeros_(self.mem_proj.weight)
+        else:
+            self.mem_proj = None
+
+        # Append mode: KV projection for memory tokens
+        if cfg.use_neural_memory and cfg.memory_mode == "append":
+            self.mem_k_proj = nn.Linear(cfg.d_model, cfg.d_model, bias=False)
+            self.mem_v_proj = nn.Linear(cfg.d_model, cfg.d_model, bias=False)
+
+    def forward(self, x: Tensor, deterministic: bool = True,
+                memory_bias: Tensor | None = None) -> Tensor:
         B, S, D = x.shape
         qkv = self.qkv_proj(x)
         q, k, v = qkv.chunk(3, dim=-1)
 
-        def reshape(t):
-            return t.reshape(B, S, self.n_heads, self.head_dim).transpose(1, 2)
+        def reshape(t, seq_len=S):
+            return t.reshape(B, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
 
         q, k, v = reshape(q), reshape(k), reshape(v)
 
         q = _apply_rope(q.float(), self.freqs).to(x.dtype)
         k = _apply_rope(k.float(), self.freqs).to(x.dtype)
 
-        scale = math.sqrt(self.head_dim)
-        attn = torch.matmul(q, k.transpose(-2, -1)) / scale
+        # Memory logit bias: shift Q based on memory retrieval
+        if self.mem_proj is not None and memory_bias is not None:
+            mb = self.mem_proj(memory_bias)  # [B, S, d_model]
+            mb = mb.reshape(B, S, self.n_heads, self.head_dim).transpose(1, 2)
+            q = q + mb
 
-        mask = torch.triu(torch.full((S, S), float("-inf"), device=x.device, dtype=x.dtype), diagonal=1)
+        # Append mode: prepend memory tokens to KV (always visible)
+        N_mem = 0
+        if self.memory_mode == "append" and memory_bias is not None:
+            mem_k = self.mem_k_proj(memory_bias)  # [B, S, D]
+            mem_v = self.mem_v_proj(memory_bias)  # [B, S, D]
+            # Use first N tokens as memory entries
+            N_mem = min(memory_bias.shape[1], 8)
+            mem_k = reshape(mem_k[:, :N_mem], N_mem)  # [B, H, N, hd]
+            mem_v = reshape(mem_v[:, :N_mem], N_mem)
+            k = torch.cat([mem_k, k], dim=2)  # [B, H, N+S, hd]
+            v = torch.cat([mem_v, v], dim=2)
+
+        scale = math.sqrt(self.head_dim)
+        S_kv = k.shape[2]
+        attn = torch.matmul(q, k.transpose(-2, -1)) / scale  # [B, H, S, N+S]
+
+        # Causal mask: memory tokens (first N_mem) are always visible
+        mask = torch.triu(
+            torch.full((S, S_kv), float("-inf"), device=x.device, dtype=x.dtype),
+            diagonal=1 + N_mem,
+        )
+        if N_mem > 0:
+            mask[:, :N_mem] = 0.0  # memory tokens visible to all positions
         attn = attn + mask.unsqueeze(0).unsqueeze(0)
         attn = F.softmax(attn.float(), dim=-1).to(x.dtype)
 
@@ -407,8 +469,9 @@ class TransformerBlock(nn.Module):
         self.norm_mlp = RMSNorm(cfg.d_model, cfg.norm_eps)
         self.mlp = MLPBlock(cfg)
 
-    def forward(self, x: Tensor, deterministic: bool = True) -> Tensor:
-        x = x + self.attention(self.norm_attn(x), deterministic)
+    def forward(self, x: Tensor, deterministic: bool = True,
+                memory_bias: Tensor | None = None) -> Tensor:
+        x = x + self.attention(self.norm_attn(x), deterministic, memory_bias=memory_bias)
         x = x + self.mlp(self.norm_mlp(x), deterministic)
         return x
 
@@ -728,6 +791,25 @@ class AttentionResidual(nn.Module):
         return torch.einsum("nbs, nbsd -> bsd", weights, V)
 
 
+# ─── SIGReg (anti-collapse regularization for memory outputs) ────────────────
+
+@torch.autocast("cuda", enabled=False)
+def sigreg_loss(z: Tensor) -> Tensor:
+    """SIGReg: penalizes representational collapse in memory outputs.
+
+    Computes covariance of z, takes singular values, and penalizes
+    them via -log(sigmoid(σ)). This pushes singular values to be large
+    and spread out, preventing collapse to a low-rank subspace.
+    """
+    z_flat = z.reshape(-1, z.shape[-1]).float()
+    z_centered = z_flat - z_flat.mean(0, keepdim=True)
+    n = z_centered.shape[0]
+    cov = z_centered.T @ z_centered / max(n - 1, 1)
+    k = min(64, cov.shape[0])
+    s = torch.linalg.svdvals(cov)[:k]
+    return -torch.log(torch.sigmoid(s) + 1e-8).mean()
+
+
 # ─── Main model ───────────────────────────────────────────────────────────────
 
 class LoopedTransformerPT(nn.Module):
@@ -782,9 +864,35 @@ class LoopedTransformerPT(nn.Module):
 
         # 7b. Attention Residuals (depth-wise attention over all block outputs)
         if cfg.use_attn_res:
-            # prelude=1 block + max_depth iterations + coda=1 block
             max_blocks = 1 + cfg.max_depth + 1
             self.attn_res = AttentionResidual(cfg.d_model, max_blocks)
+
+        # 7c. Neural Memory (Titans, arXiv:2501.00663)
+        if cfg.use_neural_memory:
+            from titans_core.memory.neural_memory import NeuralMemory
+            self.neural_memory = NeuralMemory(
+                d_model=cfg.d_model,
+                d_memory=cfg.d_memory,
+                n_memory_layers=cfg.n_memory_layers,
+                theta_lr=cfg.memory_theta_lr,
+                alpha_min=cfg.memory_alpha_min,
+                alpha_max=cfg.memory_alpha_max,
+                surprise_scale=cfg.memory_surprise_scale,
+                eta_fixed=cfg.memory_eta_fixed,
+            )
+            # Project memory output back to d_model when d_memory != d_model
+            d_mem = cfg.d_memory if cfg.d_memory != cfg.d_model else cfg.d_model
+            if d_mem != cfg.d_model:
+                self.mem_out_proj = nn.Linear(d_mem, cfg.d_model, bias=False)
+            else:
+                self.mem_out_proj = None
+
+            # Residual mode: zero-init scale + projection
+            if cfg.memory_mode == "residual":
+                self.mem_res_proj = nn.Linear(cfg.d_model, cfg.d_model, bias=False)
+                nn.init.zeros_(self.mem_res_proj.weight)
+                self.mem_res_norm = RMSNorm(cfg.d_model)
+                self.mem_res_scale = nn.Parameter(torch.zeros(1))
 
         # 8. Coda
         self.coda = nn.ModuleList([
@@ -808,6 +916,7 @@ class LoopedTransformerPT(nn.Module):
         cfg = self.cfg
         total_iters = n_max + k_max
         B, S = input_ids.shape
+        use_mem = cfg.use_neural_memory
 
         # 1. Embedding
         if self.embed_geometry in ("lorentz", "hybrid"):
@@ -818,6 +927,13 @@ class LoopedTransformerPT(nn.Module):
         # 2. Prelude
         for blk in self.prelude:
             x = blk(x, deterministic)
+
+        # 2b. Neural memory: retrieve ONCE before core loop
+        mem_out = None
+        if use_mem:
+            mem_out = self.neural_memory.retrieve(x)  # [B, S, d_memory]
+            if self.mem_out_proj is not None:
+                mem_out = self.mem_out_proj(mem_out)   # [B, S, d_model]
 
         # AttnRes: record prelude output as block 0
         use_ar = cfg.use_attn_res
@@ -846,6 +962,9 @@ class LoopedTransformerPT(nn.Module):
         else:
             streams = None
 
+        # Memory bias for attention (logit_bias and append modes pass to core blocks)
+        mem_bias_for_attn = mem_out if (use_mem and cfg.memory_mode in ("logit_bias", "append")) else None
+
         for t in range(total_iters):
             if use_hc:
                 h_agg = self.loop_hc.aggregate(streams)
@@ -856,6 +975,10 @@ class LoopedTransformerPT(nn.Module):
 
             h_new = self.injection(h_agg, e)
 
+            # Residual mode: add memory output after injection
+            if use_mem and cfg.memory_mode == "residual" and mem_out is not None:
+                h_new = h_new + self.mem_res_scale * self.mem_res_norm(self.mem_res_proj(mem_out))
+
             if use_iter_embed:
                 t_clamped = min(t, cfg.max_depth - 1)
                 iter_vec = self.iteration_embed(
@@ -863,9 +986,9 @@ class LoopedTransformerPT(nn.Module):
                 )
                 h_new = h_new + iter_vec
 
-            def _core_body(h_in):
+            def _core_body(h_in, _mem_bias=mem_bias_for_attn):
                 for blk in self.core:
-                    h_in = blk(h_in, deterministic)
+                    h_in = blk(h_in, deterministic, memory_bias=_mem_bias)
                 return h_in
 
             if cfg.use_checkpointing and self.training:
@@ -894,6 +1017,18 @@ class LoopedTransformerPT(nn.Module):
         # 7. Save h_final for outer SSM
         h_final = h
 
+        # 7b. Neural memory: update with what the loop learned
+        memory_loss = None
+        sigreg_val = None
+        if use_mem:
+            memory_loss = self.neural_memory.update(
+                h_final, return_stats=False,
+                differentiable=cfg.use_differentiable_memory,
+            )
+            if cfg.use_sigreg:
+                mem_check = self.neural_memory.retrieve(h_final)
+                sigreg_val = sigreg_loss(mem_check)
+
         # 8. Coda
         if use_ar:
             x = self.attn_res(ar_idx, window=cfg.attn_res_window)
@@ -917,12 +1052,18 @@ class LoopedTransformerPT(nn.Module):
                 labels.reshape(-1),
             )
             loss = task_loss
+            if memory_loss is not None:
+                loss = loss + memory_loss
+            if sigreg_val is not None:
+                loss = loss + cfg.sigreg_lambda * sigreg_val
 
         return {
             "logits": logits,
             "loss": loss,
             "outer_state_out": h_final,
             "depth_meta": {"t_max": total_iters, "n_max": n_max, "k_max": k_max},
+            "memory_loss": memory_loss,
+            "sigreg_loss": sigreg_val,
         }
 
 

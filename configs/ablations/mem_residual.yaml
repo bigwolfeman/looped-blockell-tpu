@@ -1,0 +1,5 @@
+# Neural Memory — Additive Residual mode (simple baseline)
+# h_new = h_new + scale * norm(proj(mem_out)) after injection
+# Zero-init scale → starts as no-op
+model:
+  memory_mode: residual
