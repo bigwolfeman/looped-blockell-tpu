@@ -6,10 +6,9 @@ model:
   use_cla: false          # disabled: OOM at batch 20 with full stack
   use_mtp: false          # disabled: 96% regression at 63M params
   use_xsa: true
-  use_attn_res: true
-  use_neural_memory: true
-  memory_mode: residual
+  use_attn_res: false     # validated separately (adds ~10GB from depth buffers)
+  use_neural_memory: false # validated separately (val PPL 25.2 at 95k)
   d_ff: 1376              # (8/3)*512 rounded to 16 for SwiGLU
 
 training:
-  batch_size: 16          # down from 20: full stack OOMs at 20
+  batch_size: 20
