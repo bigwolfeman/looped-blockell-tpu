@@ -93,6 +93,10 @@ def load_config(path: str, overlay: str | None = None) -> InteropConfig:
         csa_compress_ratio=m.get("csa_compress_ratio", 8),
         csa_compress_stride=m.get("csa_compress_stride", 4),
         csa_window_size=m.get("csa_window_size", 128),
+        use_swiglu=m.get("use_swiglu", False),
+        use_qk_norm=m.get("use_qk_norm", False),
+        n_kv_heads=m.get("n_kv_heads", None),
+        use_cla=m.get("use_cla", False),
         use_neural_memory=m.get("use_neural_memory", False),
         n_memory_layers=m.get("n_memory_layers", 6),
         d_memory=m.get("d_memory", 1024),
@@ -106,9 +110,12 @@ def load_config(path: str, overlay: str | None = None) -> InteropConfig:
         sigreg_lambda=float(m.get("sigreg_lambda", 0.02)),
         use_differentiable_memory=m.get("use_differentiable_memory", False),
         memory_append_tokens=m.get("memory_append_tokens", 8),
-        memory_inner_steps=m.get("memory_inner_steps", 5),
+        memory_inner_steps=m.get("memory_inner_steps", 1),
         memory_warmup_steps=m.get("memory_warmup_steps", 1000),
         memory_ramp_steps=m.get("memory_ramp_steps", 4000),
+        use_mtp=m.get("use_mtp", False),
+        mtp_n_heads=m.get("mtp_n_heads", 3),
+        mtp_lambda=float(m.get("mtp_lambda", 0.1)),
         lr=float(t.get("lr", 6e-4)),
         weight_decay=t.get("weight_decay", 0.1),
         warmup_steps=t.get("warmup_steps", 500),
@@ -343,6 +350,9 @@ def train(cfg: InteropConfig, args):
                 "use_sigreg": cfg.use_sigreg if cfg.use_neural_memory else None,
                 "use_xsa": cfg.use_xsa,
                 "use_attn_res": cfg.use_attn_res,
+                "use_mtp": cfg.use_mtp,
+                "mtp_n_heads": cfg.mtp_n_heads if cfg.use_mtp else None,
+                "mtp_lambda": cfg.mtp_lambda if cfg.use_mtp else None,
                 "framework": "pytorch",
             },
         )
@@ -432,6 +442,9 @@ def train(cfg: InteropConfig, args):
                     mstats = model.neural_memory.get_memory_stats()
                     for k, v in mstats.items():
                         log_dict[f"memory/{k}"] = v
+            if cfg.use_mtp and out.get("mtp_loss") is not None:
+                ml = out["mtp_loss"]
+                log_dict["mtp/loss"] = ml.item() if hasattr(ml, 'item') else ml
             wandb.log(log_dict, step=max(step, 1))
 
         # Eval

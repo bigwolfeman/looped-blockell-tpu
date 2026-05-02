@@ -64,6 +64,12 @@ class InteropConfig:
     use_loop_boundary_hc: bool = False
     hc_type: str = "diagonal"  # diagonal | jpmhc
     hc_n_streams: int = 4
+    # GQA (Grouped Query Attention)
+    n_kv_heads: int | None = None  # None = same as n_heads (full MHA)
+    # CLA (Cross-Layer Attention) — cache KV on loop iter 0, reuse for 1+
+    use_cla: bool = False
+    # QK-Norm (Gemma 2 style)
+    use_qk_norm: bool = False
     # XSA — Exclusive Self Attention (arXiv:2603.09078)
     use_xsa: bool = False
     # Attention Residuals (arXiv:2603.15031)
@@ -86,6 +92,12 @@ class InteropConfig:
     memory_inner_steps: int = 1    # K inner gradient steps per forward pass
     memory_warmup_steps: int = 1000  # steps before memory activates
     memory_ramp_steps: int = 4000    # steps to linearly ramp memory from 0→1
+    # SwiGLU activation (LLaMA-style)
+    use_swiglu: bool = False
+    # Multi-Token Prediction (arXiv:2404.19737)
+    use_mtp: bool = False
+    mtp_n_heads: int = 3    # predict t+1, t+2, t+3 (3 total)
+    mtp_lambda: float = 0.1  # weight for auxiliary MTP losses
     # CSA attention
     use_sparse_attention: bool = False
     sparse_attn_type: str = "csa"
@@ -360,16 +372,30 @@ class MultiHeadAttention(nn.Module):
     def __init__(self, cfg: InteropConfig):
         super().__init__()
         self.n_heads = cfg.n_heads
+        self.n_kv_heads = cfg.n_kv_heads if cfg.n_kv_heads is not None else cfg.n_heads
         self.d_model = cfg.d_model
         self.head_dim = cfg.head_dim
         self.use_xsa = cfg.use_xsa
-        self.qkv_proj = nn.Linear(cfg.d_model, 3 * cfg.d_model, bias=False)
+        self.kv_groups = self.n_heads // self.n_kv_heads
+
+        if self.n_kv_heads == self.n_heads:
+            self.qkv_proj = nn.Linear(cfg.d_model, 3 * cfg.d_model, bias=False)
+        else:
+            kv_dim = self.n_kv_heads * self.head_dim
+            self.q_proj = nn.Linear(cfg.d_model, cfg.d_model, bias=False)
+            self.kv_proj = nn.Linear(cfg.d_model, 2 * kv_dim, bias=False)
+
         self.out_proj = nn.Linear(cfg.d_model, cfg.d_model, bias=False)
         self.register_buffer(
             "freqs", _precompute_freqs(cfg.head_dim, cfg.max_seq_len),
             persistent=False,
         )
         self.dropout = cfg.dropout
+
+        self.use_qk_norm = getattr(cfg, 'use_qk_norm', False)
+        if self.use_qk_norm:
+            self.q_norm = RMSNorm(cfg.head_dim)
+            self.k_norm = RMSNorm(cfg.head_dim)
 
         self.memory_mode = cfg.memory_mode if cfg.use_neural_memory else None
 
@@ -386,18 +412,36 @@ class MultiHeadAttention(nn.Module):
             self.mem_v_proj = nn.Linear(cfg.d_model, cfg.d_model, bias=False)
 
     def forward(self, x: Tensor, deterministic: bool = True,
-                memory_bias: Tensor | None = None) -> Tensor:
+                memory_bias: Tensor | None = None,
+                cached_kv: tuple[Tensor, Tensor] | None = None) -> Tensor | tuple[Tensor, tuple[Tensor, Tensor]]:
         B, S, D = x.shape
-        qkv = self.qkv_proj(x)
-        q, k, v = qkv.chunk(3, dim=-1)
 
-        def reshape(t, seq_len=S):
-            return t.reshape(B, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
+        if self.n_kv_heads == self.n_heads:
+            qkv = self.qkv_proj(x)
+            q, k, v = qkv.chunk(3, dim=-1)
+            q = q.reshape(B, S, self.n_heads, self.head_dim).transpose(1, 2)
+            k = k.reshape(B, S, self.n_heads, self.head_dim).transpose(1, 2)
+            v = v.reshape(B, S, self.n_heads, self.head_dim).transpose(1, 2)
+        else:
+            q = self.q_proj(x).reshape(B, S, self.n_heads, self.head_dim).transpose(1, 2)
+            kv = self.kv_proj(x)
+            k, v = kv.chunk(2, dim=-1)
+            k = k.reshape(B, S, self.n_kv_heads, self.head_dim).transpose(1, 2)
+            v = v.reshape(B, S, self.n_kv_heads, self.head_dim).transpose(1, 2)
 
-        q, k, v = reshape(q), reshape(k), reshape(v)
+        if self.use_qk_norm:
+            q = self.q_norm(q)
+            k = self.k_norm(k)
 
         q = _apply_rope(q.float(), self.freqs).to(x.dtype)
         k = _apply_rope(k.float(), self.freqs).to(x.dtype)
+
+        # CLA: use cached KV if provided (already GQA-expanded)
+        if cached_kv is not None:
+            k, v = cached_kv
+        elif self.kv_groups > 1:
+            k = k.repeat_interleave(self.kv_groups, dim=1)
+            v = v.repeat_interleave(self.kv_groups, dim=1)
 
         # Memory logit bias: shift Q based on memory retrieval
         if self.mem_proj is not None and memory_bias is not None:
@@ -410,11 +454,10 @@ class MultiHeadAttention(nn.Module):
         if self.memory_mode == "append" and memory_bias is not None:
             mem_k = self.mem_k_proj(memory_bias)  # [B, S, D]
             mem_v = self.mem_v_proj(memory_bias)  # [B, S, D]
-            # Use first N tokens as memory entries
             N_mem = min(memory_bias.shape[1], 8)
-            mem_k = reshape(mem_k[:, :N_mem], N_mem)  # [B, H, N, hd]
-            mem_v = reshape(mem_v[:, :N_mem], N_mem)
-            k = torch.cat([mem_k, k], dim=2)  # [B, H, N+S, hd]
+            mem_k = mem_k[:, :N_mem].reshape(B, N_mem, self.n_heads, self.head_dim).transpose(1, 2)
+            mem_v = mem_v[:, :N_mem].reshape(B, N_mem, self.n_heads, self.head_dim).transpose(1, 2)
+            k = torch.cat([mem_k, k], dim=2)
             v = torch.cat([mem_v, v], dim=2)
 
         scale = math.sqrt(self.head_dim)
@@ -449,13 +492,21 @@ class MultiHeadAttention(nn.Module):
 class MLPBlock(nn.Module):
     def __init__(self, cfg: InteropConfig):
         super().__init__()
-        self.fc1 = nn.Linear(cfg.d_model, cfg.d_ff, bias=True)
-        self.fc2 = nn.Linear(cfg.d_ff, cfg.d_model, bias=True)
+        self.use_swiglu = getattr(cfg, 'use_swiglu', False)
         self.dropout = cfg.dropout
+        if self.use_swiglu:
+            self.w_gate = nn.Linear(cfg.d_model, cfg.d_ff, bias=False)
+            self.w_up = nn.Linear(cfg.d_model, cfg.d_ff, bias=False)
+            self.w_down = nn.Linear(cfg.d_ff, cfg.d_model, bias=False)
+        else:
+            self.fc1 = nn.Linear(cfg.d_model, cfg.d_ff, bias=True)
+            self.fc2 = nn.Linear(cfg.d_ff, cfg.d_model, bias=True)
 
     def forward(self, x: Tensor, deterministic: bool = True) -> Tensor:
-        h = F.gelu(self.fc1(x))
-        out = self.fc2(h)
+        if self.use_swiglu:
+            out = self.w_down(F.silu(self.w_gate(x)) * self.w_up(x))
+        else:
+            out = self.fc2(F.gelu(self.fc1(x)))
         if self.dropout > 0.0 and not deterministic:
             out = F.dropout(out, p=self.dropout, training=True)
         return out
@@ -473,8 +524,10 @@ class TransformerBlock(nn.Module):
         self.mlp = MLPBlock(cfg)
 
     def forward(self, x: Tensor, deterministic: bool = True,
-                memory_bias: Tensor | None = None) -> Tensor:
-        x = x + self.attention(self.norm_attn(x), deterministic, memory_bias=memory_bias)
+                memory_bias: Tensor | None = None,
+                cached_kv: tuple[Tensor, Tensor] | None = None) -> Tensor:
+        x = x + self.attention(self.norm_attn(x), deterministic,
+                               memory_bias=memory_bias, cached_kv=cached_kv)
         x = x + self.mlp(self.norm_mlp(x), deterministic)
         return x
 
@@ -813,6 +866,19 @@ def sigreg_loss(z: Tensor) -> Tensor:
     return -torch.log(torch.sigmoid(s) + 1e-8).mean()
 
 
+# ─── Multi-Token Prediction heads ─────────────────────────────────────────────
+
+class MTPHead(nn.Module):
+    """Single MTP prediction head: proj → norm → shared unembedding."""
+    def __init__(self, d_model: int):
+        super().__init__()
+        self.proj = nn.Linear(d_model, d_model, bias=False)
+        self.norm = RMSNorm(d_model)
+
+    def forward(self, h: Tensor) -> Tensor:
+        return self.norm(self.proj(h))
+
+
 # ─── Main model ───────────────────────────────────────────────────────────────
 
 class LoopedTransformerPT(nn.Module):
@@ -904,6 +970,12 @@ class LoopedTransformerPT(nn.Module):
 
         # 9. Final norm (no separate lm_head — weight-tied)
         self.final_norm = RMSNorm(cfg.d_model, cfg.norm_eps)
+
+        # 10. MTP heads (share unembedding via embed.weight)
+        if cfg.use_mtp:
+            self.mtp_heads = nn.ModuleList([
+                MTPHead(cfg.d_model) for _ in range(cfg.mtp_n_heads - 1)
+            ])
 
     def forward(
         self,
@@ -1000,15 +1072,46 @@ class LoopedTransformerPT(nn.Module):
                 )
                 h_new = h_new + iter_vec
 
-            def _core_body(h_in, _mem_bias=mem_bias_for_attn):
-                for blk in self.core:
-                    h_in = blk(h_in, deterministic, memory_bias=_mem_bias)
-                return h_in
-
-            if cfg.use_checkpointing and self.training:
-                h_new = checkpoint(_core_body, h_new, use_reentrant=False)
+            if cfg.use_cla and t > 0 and hasattr(self, '_cla_cache'):
+                # CLA: reuse KV from iteration 0, only recompute Q
+                for i, blk in enumerate(self.core):
+                    h_new = blk(h_new, deterministic, memory_bias=mem_bias_for_attn,
+                                cached_kv=self._cla_cache[i])
             else:
-                h_new = _core_body(h_new)
+                def _core_body(h_in, _mem_bias=mem_bias_for_attn):
+                    for blk in self.core:
+                        h_in = blk(h_in, deterministic, memory_bias=_mem_bias)
+                    return h_in
+
+                if cfg.use_checkpointing and self.training:
+                    h_new = checkpoint(_core_body, h_new, use_reentrant=False)
+                else:
+                    h_new = _core_body(h_new)
+
+                # CLA: cache KV from first iteration
+                if cfg.use_cla and t == 0:
+                    self._cla_cache = []
+                    with torch.no_grad():
+                        for blk in self.core:
+                            attn = blk.attention
+                            h_normed = blk.norm_attn(h_new)
+                            if attn.n_kv_heads == attn.n_heads:
+                                qkv = attn.qkv_proj(h_normed)
+                                _, k_c, v_c = qkv.chunk(3, dim=-1)
+                                k_c = k_c.reshape(B, S, attn.n_heads, attn.head_dim).transpose(1, 2)
+                                v_c = v_c.reshape(B, S, attn.n_heads, attn.head_dim).transpose(1, 2)
+                            else:
+                                kv = attn.kv_proj(h_normed)
+                                k_c, v_c = kv.chunk(2, dim=-1)
+                                k_c = k_c.reshape(B, S, attn.n_kv_heads, attn.head_dim).transpose(1, 2)
+                                v_c = v_c.reshape(B, S, attn.n_kv_heads, attn.head_dim).transpose(1, 2)
+                            if attn.use_qk_norm:
+                                k_c = attn.k_norm(k_c)
+                            k_c = _apply_rope(k_c.float(), attn.freqs).to(h_new.dtype)
+                            if attn.kv_groups > 1:
+                                k_c = k_c.repeat_interleave(attn.kv_groups, dim=1)
+                                v_c = v_c.repeat_interleave(attn.kv_groups, dim=1)
+                            self._cla_cache.append((k_c, v_c))
 
             if use_ar:
                 self.attn_res.append(h_new)
@@ -1063,15 +1166,38 @@ class LoopedTransformerPT(nn.Module):
 
         # 10. Loss
         loss = None
+        mtp_loss = None
         if labels is not None:
             task_loss = F.cross_entropy(
                 logits.reshape(-1, cfg.vocab_size),
                 labels.reshape(-1),
             )
             loss = task_loss
-            # memory_loss is for logging only — NOT added to outer loss.
-            # MLP weights are managed exclusively by the inner loop.
-            # SIGReg flows through retrieve() → W_Q only (stop-grad on MLP).
+
+            # MTP: auxiliary losses for predicting t+2, t+3, ...
+            if cfg.use_mtp:
+                # x_pre_norm is the hidden state before final_norm (reuse for MTP heads)
+                # Each head k predicts token at position t+k+1 (head 0 = main = t+1)
+                mtp_losses = []
+                for k, head in enumerate(self.mtp_heads):
+                    shift = k + 1  # head 0 predicts t+2, head 1 predicts t+3
+                    if shift >= labels.shape[1]:
+                        break
+                    h_mtp = head(x)  # proj + norm on post-coda hidden states
+                    if self.embed_geometry in ("lorentz", "hybrid"):
+                        mtp_logits = self.embed.attend(h_mtp)
+                    else:
+                        mtp_logits = F.linear(h_mtp, self.embed.weight)
+                    # Shift: predict labels[:, shift:] from logits[:, :-shift]
+                    mtp_l = F.cross_entropy(
+                        mtp_logits[:, :-shift].reshape(-1, cfg.vocab_size),
+                        labels[:, shift:].reshape(-1),
+                    )
+                    mtp_losses.append(mtp_l)
+                if mtp_losses:
+                    mtp_loss = sum(mtp_losses) / len(mtp_losses)
+                    loss = loss + cfg.mtp_lambda * mtp_loss
+
             if sigreg_val is not None:
                 loss = loss + cfg.sigreg_lambda * sigreg_val
 
@@ -1081,6 +1207,7 @@ class LoopedTransformerPT(nn.Module):
             "outer_state_out": h_final,
             "depth_meta": {"t_max": total_iters, "n_max": n_max, "k_max": k_max},
             "memory_loss": memory_loss,
+            "mtp_loss": mtp_loss,
             "sigreg_loss": sigreg_val,
         }
 

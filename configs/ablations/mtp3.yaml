@@ -1,0 +1,5 @@
+# Multi-Token Prediction: 3 heads (t+1, t+2, t+3)
+model:
+  use_mtp: true
+  mtp_n_heads: 3
+  mtp_lambda: 0.1
