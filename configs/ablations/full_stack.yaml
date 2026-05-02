@@ -1,0 +1,15 @@
+# Full stack: all uplifts combined (MTP disabled — hurts at <1B params)
+model:
+  use_swiglu: true
+  use_qk_norm: true
+  n_kv_heads: 2          # GQA 4:1 (8 Q heads, 2 KV heads)
+  use_cla: false          # disabled: OOM at batch 20 with full stack
+  use_mtp: false          # disabled: 96% regression at 63M params
+  use_xsa: true
+  use_attn_res: true
+  use_neural_memory: true
+  memory_mode: residual
+  d_ff: 1376              # (8/3)*512 rounded to 16 for SwiGLU
+
+training:
+  batch_size: 16          # down from 20: full stack OOMs at 20
