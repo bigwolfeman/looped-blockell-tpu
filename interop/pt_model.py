@@ -404,6 +404,17 @@ class MultiHeadAttention(nn.Module):
             self.q_norm = RMSNorm(cfg.head_dim)
             self.k_norm = RMSNorm(cfg.head_dim)
 
+        # CSA: compressed sparse attention (merged, inherits GQA/QKNorm/XSA)
+        self.use_csa = cfg.use_sparse_attention and cfg.sparse_attn_type == "csa"
+        if self.use_csa:
+            self.csa_window = cfg.csa_window_size
+            self.csa_compress_ratio = cfg.csa_compress_ratio
+            self.csa_compress_stride = cfg.csa_compress_stride
+            self.kv_compressor = KVCompressor(cfg.d_model, cfg.csa_compress_ratio, cfg.csa_compress_stride)
+            kv_dim_c = self.n_kv_heads * self.head_dim
+            self.kv_proj_c = nn.Linear(cfg.d_model, 2 * kv_dim_c, bias=False)
+            self.sink_logit = nn.Parameter(torch.zeros(cfg.n_heads, 1))
+
         self.memory_mode = cfg.memory_mode if cfg.use_neural_memory else None
 
         # Memory logit bias: zero-init projection so it starts as no-op
@@ -452,26 +463,37 @@ class MultiHeadAttention(nn.Module):
 
         # Memory logit bias: shift Q based on memory retrieval
         if self.mem_proj is not None and memory_bias is not None:
-            mb = self.mem_proj(memory_bias)  # [B, S, d_model]
+            mb = self.mem_proj(memory_bias)
             mb = mb.reshape(B, S, self.n_heads, self.head_dim).transpose(1, 2)
             q = q + mb
 
-        # Append mode: prepend memory tokens to KV (always visible)
+        # CSA path: compressed + sliding window + sink (with GQA/QKNorm/XSA)
+        if self.use_csa and S > self.csa_window:
+            out = self._forward_csa(q, k, v, x, B, S, deterministic)
+            if self.use_xsa:
+                v_full = k  # reuse for XSA (approximation — v is GQA-expanded)
+                v_full = v
+                v_norm_sq = (v_full * v_full).sum(-1, keepdim=True).clamp(min=1e-8)
+                proj = (out * v_full).sum(-1, keepdim=True) / v_norm_sq
+                out = out - proj * v_full
+            out = out.transpose(1, 2).reshape(B, S, D)
+            return self.out_proj(out)
+
+        # Append mode: prepend memory tokens to KV
         N_mem = 0
         if self.memory_mode == "append" and memory_bias is not None:
-            mem_k = self.mem_k_proj(memory_bias)  # [B, S, D]
-            mem_v = self.mem_v_proj(memory_bias)  # [B, S, D]
+            mem_k = self.mem_k_proj(memory_bias)
+            mem_v = self.mem_v_proj(memory_bias)
             N_mem = min(memory_bias.shape[1], 8)
             mem_k = mem_k[:, :N_mem].reshape(B, N_mem, self.n_heads, self.head_dim).transpose(1, 2)
             mem_v = mem_v[:, :N_mem].reshape(B, N_mem, self.n_heads, self.head_dim).transpose(1, 2)
             k = torch.cat([mem_k, k], dim=2)
             v = torch.cat([mem_v, v], dim=2)
 
-        # Fast path: SDPA with fused kernel (no append tokens, handles GQA natively)
+        # Fast path: SDPA (no append tokens, no XSA)
         if N_mem == 0 and not self.use_xsa:
             drop_p = self.dropout if (not deterministic and self.dropout > 0) else 0.0
             if self.kv_groups > 1 and cached_kv is None:
-                # GQA: undo the repeat_interleave, let SDPA handle it
                 k_gqa = k[:, ::self.kv_groups]
                 v_gqa = v[:, ::self.kv_groups]
                 out = F.scaled_dot_product_attention(
@@ -485,11 +507,10 @@ class MultiHeadAttention(nn.Module):
             out = out.transpose(1, 2).reshape(B, S, D)
             return self.out_proj(out)
 
-        # Slow path: manual attention (append tokens or XSA)
+        # Manual path: append tokens or XSA
         scale = math.sqrt(self.head_dim)
         S_kv = k.shape[2]
         attn = torch.matmul(q, k.transpose(-2, -1)) / scale
-
         mask = torch.triu(
             torch.full((S, S_kv), float("-inf"), device=x.device, dtype=x.dtype),
             diagonal=1 + N_mem,
@@ -498,19 +519,66 @@ class MultiHeadAttention(nn.Module):
             mask[:, :N_mem] = 0.0
         attn = attn + mask.unsqueeze(0).unsqueeze(0)
         attn = F.softmax(attn.float(), dim=-1).to(x.dtype)
-
         if self.dropout > 0.0 and not deterministic:
             attn = F.dropout(attn, p=self.dropout, training=True)
-
         out = torch.matmul(attn, v)
-
         if self.use_xsa:
             v_norm_sq = (v * v).sum(-1, keepdim=True).clamp(min=1e-8)
             proj = (out * v).sum(-1, keepdim=True) / v_norm_sq
             out = out - proj * v
-
         out = out.transpose(1, 2).reshape(B, S, D)
         return self.out_proj(out)
+
+    def _forward_csa(self, q: Tensor, k: Tensor, v: Tensor,
+                     x: Tensor, B: int, S: int, deterministic: bool) -> Tensor:
+        """CSA: sliding window + compressed global + sink, on top of GQA Q/K/V."""
+        W = self.csa_window
+        hd = self.head_dim
+        scale = math.sqrt(hd)
+
+        # Compress KV from raw input (independent of main K/V)
+        x_c = self.kv_compressor(x)
+        Lc = x_c.shape[1]
+        kv_c = self.kv_proj_c(x_c)
+        k_c, v_c = kv_c.chunk(2, dim=-1)
+        k_c = k_c.reshape(B, Lc, self.n_kv_heads, hd).transpose(1, 2)
+        v_c = v_c.reshape(B, Lc, self.n_kv_heads, hd).transpose(1, 2)
+        if self.use_qk_norm:
+            k_c = self.k_norm(k_c)
+        if self.kv_groups > 1:
+            k_c = k_c.repeat_interleave(self.kv_groups, dim=1)
+            v_c = v_c.repeat_interleave(self.kv_groups, dim=1)
+
+        # Compressed branch scores
+        compressed_scores = torch.matmul(q, k_c.transpose(-2, -1)) / scale
+        stride = self.csa_compress_stride
+        ratio = self.csa_compress_ratio
+        entry_end = torch.arange(Lc, device=x.device) * stride + ratio - 1
+        query_pos = torch.arange(S, device=x.device)
+        causal_c = query_pos[:, None] >= entry_end[None, :]
+        compressed_scores = compressed_scores.masked_fill(~causal_c[None, None], float("-inf"))
+
+        # Sliding window scores
+        window_scores = torch.matmul(q, k.transpose(-2, -1)) / scale
+        pos = torch.arange(S, device=x.device)
+        dist = pos[:, None] - pos[None, :]
+        window_mask = (dist >= 0) & (dist < W)
+        window_scores = window_scores.masked_fill(~window_mask[None, None], float("-inf"))
+
+        # Sink
+        sink_broadcast = self.sink_logit[None, :, None, :].expand(B, self.n_heads, S, 1)
+
+        # Combined softmax
+        all_scores = torch.cat([
+            compressed_scores.float(), window_scores.float(), sink_broadcast.float()
+        ], dim=-1)
+        attn_w = F.softmax(all_scores, dim=-1).to(x.dtype)
+
+        w_c = attn_w[..., :Lc]
+        w_w = attn_w[..., Lc:Lc + S]
+
+        out = torch.matmul(w_c, v_c) + torch.matmul(w_w, v)
+        return out
 
 
 class PrunableLinear(nn.Module):
@@ -713,22 +781,15 @@ class TransformerBlock(nn.Module):
     def __init__(self, cfg: InteropConfig, prunable: bool = False):
         super().__init__()
         self.norm_attn = RMSNorm(cfg.d_model, cfg.norm_eps)
-        if cfg.use_sparse_attention and cfg.sparse_attn_type == "csa":
-            self.attention = CompressedSparseAttention(cfg)
-        else:
-            self.attention = MultiHeadAttention(cfg)
+        self.attention = MultiHeadAttention(cfg)
         self.norm_mlp = RMSNorm(cfg.d_model, cfg.norm_eps)
         self.mlp = MLPBlock(cfg, prunable=prunable)
 
     def forward(self, x: Tensor, deterministic: bool = True,
                 memory_bias: Tensor | None = None,
                 cached_kv: tuple[Tensor, Tensor] | None = None) -> Tensor:
-        if cached_kv is not None and isinstance(self.attention, MultiHeadAttention):
-            x = x + self.attention(self.norm_attn(x), deterministic,
-                                   memory_bias=memory_bias, cached_kv=cached_kv)
-        else:
-            x = x + self.attention(self.norm_attn(x), deterministic,
-                                   memory_bias=memory_bias)
+        x = x + self.attention(self.norm_attn(x), deterministic,
+                               memory_bias=memory_bias, cached_kv=cached_kv)
         x = x + self.mlp(self.norm_mlp(x), deterministic)
         return x
 

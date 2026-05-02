@@ -38,12 +38,12 @@ model:
   sparse_attn_type: csa
   csa_compress_ratio: 8
   csa_compress_stride: 4
-  csa_window_size: 128
+  csa_window_size: 4096     # DeepSeek-V2 default (covers full seq at 1024)
   sparse_attn_n_indexer_heads: 4
 
-  # Attention Residuals (online softmax — O(1) memory)
-  use_attn_res: true
-  attn_res_window: 0   # 0 = full (online softmax handles memory)
+  # Attention Residuals — disabled for preflight (marginal at this scale,
+  # detached entries cause uniform-weight dilution at init)
+  use_attn_res: false
 
   # Neural Memory (Titans, residual mode)
   use_neural_memory: true
