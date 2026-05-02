@@ -1,0 +1,4 @@
+# Append + Residual: both memory integration modes active
+model:
+  memory_mode: append_residual
+  memory_append_tokens: 8

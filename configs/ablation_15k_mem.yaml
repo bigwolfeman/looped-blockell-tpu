@@ -1,6 +1,5 @@
-# 100k-step ablation base: 3p+6c+3coda, d=512, hybrid embeddings
-# ~67M params (63M backbone + ~6M memory MLP + ~0.8M projections)
-# 100k * 20 * 1024 ≈ 2B tokens on FineWeb-Edu
+# 15k-step memory ablation: 3p+6c+3coda, d=512, hybrid embeddings
+# Same architecture as 100k run but shorter for sensitivity testing
 
 model:
   d_model: 512
@@ -20,26 +19,24 @@ model:
   embed_geometry: hybrid
   lorentz_dim_fraction: 0.5
 
-  # Neural memory defaults (override per ablation)
   use_neural_memory: true
   n_memory_layers: 6
   d_memory: 1024
   memory_theta_lr: 0.01
-  memory_inner_steps: 1
-  memory_warmup_steps: 1000   # backbone-only for first 1k steps
-  memory_ramp_steps: 4000     # linear ramp memory 0→1 over steps 1k-5k
   memory_alpha_min: 0.0001
   memory_alpha_max: 0.003
   memory_surprise_scale: 3.0
   memory_eta_fixed: 0.95
   use_sigreg: false
-  sigreg_lambda: 0.02
   use_differentiable_memory: false
+  memory_inner_steps: 1
+  memory_warmup_steps: 500
+  memory_ramp_steps: 2000
 
 training:
   lr: 0.0006
   weight_decay: 0.1
-  warmup_steps: 2000
-  total_steps: 100000
+  warmup_steps: 500
+  total_steps: 15000
   batch_size: 20
   grad_clip: 1.0

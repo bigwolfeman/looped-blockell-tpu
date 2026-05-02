@@ -1,0 +1,6 @@
+# Alpha sensitivity: high forgetting (short memory)
+# Half-life ~23 steps = 0.47M tokens at alpha_max
+model:
+  memory_mode: residual
+  memory_alpha_min: 0.001
+  memory_alpha_max: 0.01

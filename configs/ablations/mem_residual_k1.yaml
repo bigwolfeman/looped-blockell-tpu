@@ -1,0 +1,4 @@
+# K=1 inner gradient step (maximum speed, minimum memory learning)
+model:
+  memory_mode: residual
+  memory_inner_steps: 1

@@ -1,0 +1,4 @@
+# K=3 inner gradient steps (speed optimization)
+model:
+  memory_mode: residual
+  memory_inner_steps: 3

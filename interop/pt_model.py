@@ -83,7 +83,7 @@ class InteropConfig:
     sigreg_lambda: float = 0.02
     use_differentiable_memory: bool = False
     memory_append_tokens: int = 8  # N for append mode
-    memory_inner_steps: int = 5    # K inner gradient steps per forward pass
+    memory_inner_steps: int = 1    # K inner gradient steps per forward pass
     memory_warmup_steps: int = 1000  # steps before memory activates
     memory_ramp_steps: int = 4000    # steps to linearly ramp memory from 0→1
     # CSA attention
@@ -891,7 +891,7 @@ class LoopedTransformerPT(nn.Module):
                 self.mem_out_proj = None
 
             # Residual mode: zero-init scale + projection
-            if cfg.memory_mode == "residual":
+            if cfg.memory_mode in ("residual", "append_residual"):
                 self.mem_res_proj = nn.Linear(cfg.d_model, cfg.d_model, bias=False)
                 nn.init.zeros_(self.mem_res_proj.weight)
                 self.mem_res_norm = RMSNorm(cfg.d_model)
@@ -976,8 +976,8 @@ class LoopedTransformerPT(nn.Module):
         else:
             streams = None
 
-        # Memory bias for attention (logit_bias and append modes pass to core blocks)
-        mem_bias_for_attn = mem_out if (use_mem and cfg.memory_mode in ("logit_bias", "append")) else None
+        # Memory bias for attention (logit_bias, append, append_residual modes pass to core blocks)
+        mem_bias_for_attn = mem_out if (use_mem and cfg.memory_mode in ("logit_bias", "append", "append_residual")) else None
 
         for t in range(total_iters):
             if use_hc:
@@ -990,7 +990,7 @@ class LoopedTransformerPT(nn.Module):
             h_new = self.injection(h_agg, e)
 
             # Residual mode: add memory output after injection
-            if use_mem and cfg.memory_mode == "residual" and mem_out is not None:
+            if use_mem and cfg.memory_mode in ("residual", "append_residual") and mem_out is not None:
                 h_new = h_new + self.mem_res_scale * self.mem_res_norm(self.mem_res_proj(mem_out))
 
             if use_iter_embed:
