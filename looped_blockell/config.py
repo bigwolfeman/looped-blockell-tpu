@@ -43,6 +43,12 @@ class LoopedBlockELLConfig:
     use_loop_boundary_hc: bool = False
     hc_n_streams: int = 4  # number of parallel residual streams
 
+    # GQA (Grouped Query Attention)
+    n_kv_heads: int | None = None  # None = same as n_heads (full MHA)
+
+    # QK-Norm (Gemma 2 style — RMSNorm on Q and K per head_dim, before RoPE)
+    use_qk_norm: bool = False
+
     # Attention
     use_sparse_attention: bool = False
     sparse_attn_type: str = "dsa"  # dsa (block-level) | csa (compressed sparse, V4-style)
@@ -80,6 +86,25 @@ class LoopedBlockELLConfig:
     batch_size: int = 8
     grad_clip: float = 1.0
 
+    # MLP variant
+    use_swiglu: bool = False  # SwiGLU (w_gate/w_up/w_down) vs GELU (fc1/fc2)
+    # Note: when use_swiglu=True, d_ff is the intermediate dim for each of w_gate/w_up
+    # (same as standard SwiGLU — total params per MLP: 3 * d_model * d_ff instead of 2)
+
+    # Neural Long-Term Memory (Titans paper, arXiv:2501.00663)
+    use_neural_memory: bool = False
+    n_memory_layers: int = 4
+    d_memory: int = 0            # 0 → use d_model
+    memory_mode: str = "residual"  # residual | logit_bias (only residual implemented)
+    memory_theta_lr: float = 0.01
+    memory_alpha_min: float = 0.0001
+    memory_alpha_max: float = 0.003
+    memory_surprise_scale: float = 3.0
+    memory_eta_fixed: float = 0.95
+    memory_warmup_steps: int = 1000
+    memory_ramp_steps: int = 4000
+    memory_update_interval: int = 5   # update memory weights every N forward passes
+
     # Misc
     dropout: float = 0.0
     norm_eps: float = 1e-5
@@ -99,6 +124,9 @@ class LoopedBlockELLConfig:
             assert lorentz_dim > 0 and lorentz_dim < self.d_model
         if self.bptt_depth is None:
             self.bptt_depth = (self.mean_depth + 1) // 2
+        if self.n_kv_heads is not None:
+            assert self.n_heads % self.n_kv_heads == 0, \
+                f"n_heads ({self.n_heads}) must be divisible by n_kv_heads ({self.n_kv_heads})"
 
     @property
     def head_dim(self) -> int:

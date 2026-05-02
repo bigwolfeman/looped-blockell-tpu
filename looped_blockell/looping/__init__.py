@@ -3,6 +3,7 @@
 from .diagonal_injection import DiagonalInjection
 from .depth_sampler import DepthPlan, sample_depth, sample_fixed
 from .looped_model import LoopedTransformer, create_looped_transformer, model_fwd
+from .neural_memory import NeuralMemory
 
 __all__ = [
     "DiagonalInjection",
@@ -12,4 +13,5 @@ __all__ = [
     "LoopedTransformer",
     "create_looped_transformer",
     "model_fwd",
+    "NeuralMemory",
 ]

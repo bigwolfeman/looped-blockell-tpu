@@ -60,6 +60,7 @@ from .diagonal_injection import DiagonalInjection
 from .hyper_connections import LoopBoundaryHC, init_streams, collapse_streams
 from .attention_residual import AttentionResidual
 from .depth_sampler import DepthPlan, sample_depth, sample_fixed
+from .neural_memory import NeuralMemory
 
 
 class LoopedTransformer(nn.Module):
@@ -82,6 +83,7 @@ class LoopedTransformer(nn.Module):
         deterministic: bool = True,
         use_iter_embed: bool = False,
         outer_state: Optional[jnp.ndarray] = None,
+        memory_scale: float = 1.0,
     ) -> dict:
         """Forward pass.
 
@@ -102,6 +104,10 @@ class LoopedTransformer(nn.Module):
                           When provided and cfg.use_outer_ssm=True, injected
                           into the prelude output via a separate diagonal
                           injection before the core loop begins.
+            memory_scale: Warmup ramp multiplier for memory update step size.
+                          Caller computes: 0 for first warmup_steps, then linear
+                          ramp from 0→1 over memory_ramp_steps. Default 1.0
+                          (full strength). Ignored when use_neural_memory=False.
 
         Returns:
             dict with:
@@ -208,6 +214,30 @@ class LoopedTransformer(nn.Module):
                 name="loop_hc",
             )
 
+        # ── Neural Memory (Titans paper) ─────────────────────────────────────
+        # Created unconditionally so params always exist (easier checkpoint compat).
+        # Only USED when cfg.use_neural_memory=True.
+        use_mem = cfg.use_neural_memory
+        memory = NeuralMemory(
+            d_model=cfg.d_model,
+            d_memory=cfg.d_memory,
+            n_memory_layers=cfg.n_memory_layers,
+            theta_lr=cfg.memory_theta_lr,
+            alpha_min=cfg.memory_alpha_min,
+            alpha_max=cfg.memory_alpha_max,
+            surprise_scale=cfg.memory_surprise_scale,
+            eta_fixed=cfg.memory_eta_fixed,
+            name="neural_memory",
+        )
+        # Projection from d_model → d_model to mix memory readout into hidden state.
+        # Near-zero init so it doesn't perturb the pre-memory model at warmup.
+        mem_proj = nn.Dense(
+            cfg.d_model,
+            use_bias=False,
+            kernel_init=nn.initializers.normal(stddev=0.001),
+            name="mem_proj",
+        )
+
         # Attention Residuals (depth-wise attention over block outputs)
         use_ar = cfg.use_attn_res
         attn_res = None
@@ -225,6 +255,10 @@ class LoopedTransformer(nn.Module):
         for blk in core_blocks:
             _ = blk(h, deterministic=deterministic)
         _ = iter_embed(jnp.array([0]))
+        # Force memory + mem_proj params to exist before scan traces the body.
+        if use_mem:
+            _dummy_mem = memory.retrieve(h)
+            _ = mem_proj(_dummy_mem)
         if use_hc:
             _dummy_streams = init_streams(h, cfg.hc_n_streams)
             _ = hc(_dummy_streams, mode="aggregate")
@@ -232,6 +266,14 @@ class LoopedTransformer(nn.Module):
         if use_ar:
             _dummy_buf = jnp.zeros((ar_max_blocks, B, S, cfg.d_model), dtype=h.dtype)
             _ = attn_res(_dummy_buf, 1, block_idx=0)
+
+        # ── Memory retrieve (before core loop) ──────────────────────────────
+        # Retrieve from memory once using the post-prelude hidden state.
+        # mem_readout is closed over inside the scan body for residual injection.
+        if use_mem:
+            mem_readout = memory.retrieve(x)          # [B, S, d_model]
+        else:
+            mem_readout = jnp.zeros(())
 
         # Build initial carry for scan
         if use_hc:
@@ -267,6 +309,11 @@ class LoopedTransformer(nn.Module):
 
             for blk in core_blocks:
                 h_new = blk(h_new, deterministic=deterministic)
+
+            # Memory residual: add projected memory readout (residual mode)
+            # mem_readout is closed over from before the scan.
+            if use_mem:
+                h_new = h_new + mem_proj(mem_readout) * memory_scale
 
             # Append to AttnRes buffer (before detach so values have gradient)
             if use_ar:
@@ -305,7 +352,14 @@ class LoopedTransformer(nn.Module):
         if use_hc:
             h = collapse_streams(streams)
 
-        # ── 7. Capture h_final for outer SSM before coda transforms it ────────
+        # ── 7. Memory update (after core loop, using final hidden state) ─────
+        # update() writes into 'memory_state' collection (mutable).
+        # In the training loop: pass mutable=["memory_state"] to model.apply.
+        # During read-only eval: update() is a no-op (guarded by is_mutable_collection).
+        if use_mem and memory_scale > 0.0:
+            memory.update(h, scale=memory_scale)
+
+        # ── 7b. Capture h_final for outer SSM before coda transforms it ───────
         h_final = h
 
         # ── 8. Coda ──────────────────────────────────────────────────────────

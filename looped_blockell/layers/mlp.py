@@ -96,14 +96,19 @@ class BlockELLLinear(nn.Module):
 
 
 class MLPBlock(nn.Module):
-    """Two-layer GELU MLP using Block-ELL sparse matmul.
+    """MLP block using Block-ELL sparse matmul.
 
-    fc1: [d_model → d_ff], fc2: [d_ff → d_model].
-    Both use BlockELLLinear — starts at density=1.0 (dense-equivalent),
+    Two variants:
+      - GELU (default): fc1: [d_model → d_ff], fc2: [d_ff → d_model]
+      - SwiGLU: w_gate/w_up: [d_model → d_ff], w_down: [d_ff → d_model]
+                output = w_down(silu(w_gate(x)) * w_up(x))
+
+    All projections use BlockELLLinear — starts at density=1.0 (dense-equivalent),
     pruned by CMS during training, compacted before routing phase.
     """
     d_model: int
     d_ff: int
+    use_swiglu: bool = False
     dropout: float = 0.0
     tile_size: int = 16
     density: float = 1.0
@@ -111,24 +116,52 @@ class MLPBlock(nn.Module):
 
     @nn.compact
     def __call__(self, x: jnp.ndarray, deterministic: bool = True) -> jnp.ndarray:
-        hidden = BlockELLLinear(
-            out_features=self.d_ff,
-            in_features=self.d_model,
-            tile_size=self.tile_size,
-            density=self.density,
-            dtype=self.dtype,
-            name="fc1",
-        )(x)
-        hidden = jax.nn.gelu(hidden)
-
-        out = BlockELLLinear(
-            out_features=self.d_model,
-            in_features=self.d_ff,
-            tile_size=self.tile_size,
-            density=self.density,
-            dtype=self.dtype,
-            name="fc2",
-        )(hidden)
+        if self.use_swiglu:
+            # SwiGLU: gate + up projections fused via element-wise gating, bias=False
+            gate = BlockELLLinear(
+                out_features=self.d_ff,
+                in_features=self.d_model,
+                tile_size=self.tile_size,
+                density=self.density,
+                dtype=self.dtype,
+                name="w_gate",
+            )(x)
+            up = BlockELLLinear(
+                out_features=self.d_ff,
+                in_features=self.d_model,
+                tile_size=self.tile_size,
+                density=self.density,
+                dtype=self.dtype,
+                name="w_up",
+            )(x)
+            hidden = jax.nn.silu(gate) * up
+            out = BlockELLLinear(
+                out_features=self.d_model,
+                in_features=self.d_ff,
+                tile_size=self.tile_size,
+                density=self.density,
+                dtype=self.dtype,
+                name="w_down",
+            )(hidden)
+        else:
+            # Standard GELU MLP
+            hidden = BlockELLLinear(
+                out_features=self.d_ff,
+                in_features=self.d_model,
+                tile_size=self.tile_size,
+                density=self.density,
+                dtype=self.dtype,
+                name="fc1",
+            )(x)
+            hidden = jax.nn.gelu(hidden)
+            out = BlockELLLinear(
+                out_features=self.d_model,
+                in_features=self.d_ff,
+                tile_size=self.tile_size,
+                density=self.density,
+                dtype=self.dtype,
+                name="fc2",
+            )(hidden)
 
         if self.dropout > 0.0:
             out = nn.Dropout(rate=self.dropout)(out, deterministic=deterministic)
