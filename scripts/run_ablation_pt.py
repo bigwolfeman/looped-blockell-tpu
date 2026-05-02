@@ -32,6 +32,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from interop.pt_model import (
     InteropConfig,
     LoopedTransformerPT,
+    PrunableLinear,
     DepthPlan,
     sample_depth,
     sample_fixed,
@@ -40,6 +41,7 @@ from interop.pt_model import (
 CKPT_INTERVAL = 2000
 EVAL_INTERVAL = 500
 LOG_INTERVAL = 20
+SCORE_INTERVAL = 10
 
 
 def _deep_merge(base: dict, override: dict) -> dict:
@@ -61,7 +63,7 @@ def load_config(path: str, overlay: str | None = None) -> InteropConfig:
         raw = _deep_merge(raw, over)
     m = raw.get("model", {})
     t = raw.get("training", {})
-    return InteropConfig(
+    cfg = InteropConfig(
         d_model=m.get("d_model", 512),
         n_heads=m.get("n_heads", 8),
         d_ff=m.get("d_ff", 2048),
@@ -113,9 +115,14 @@ def load_config(path: str, overlay: str | None = None) -> InteropConfig:
         memory_inner_steps=m.get("memory_inner_steps", 1),
         memory_warmup_steps=m.get("memory_warmup_steps", 1000),
         memory_ramp_steps=m.get("memory_ramp_steps", 4000),
+        memory_update_interval=m.get("memory_update_interval", 1),
         use_mtp=m.get("use_mtp", False),
         mtp_n_heads=m.get("mtp_n_heads", 3),
         mtp_lambda=float(m.get("mtp_lambda", 0.1)),
+        enable_pruning=m.get("enable_pruning", False),
+        tile_size=m.get("tile_size", 16),
+        enable_routing=m.get("enable_routing", False),
+        n_clusters=m.get("n_clusters", 16),
         lr=float(t.get("lr", 6e-4)),
         weight_decay=t.get("weight_decay", 0.1),
         warmup_steps=t.get("warmup_steps", 500),
@@ -123,6 +130,16 @@ def load_config(path: str, overlay: str | None = None) -> InteropConfig:
         batch_size=t.get("batch_size", 20),
         grad_clip=t.get("grad_clip", 1.0),
     )
+    # Pipeline schedule — stored as extra attrs (not in dataclass)
+    cfg.prune_start = t.get("prune_start", 10000)
+    cfg.prune_end = t.get("prune_end", 50000)
+    cfg.prune_interval = t.get("prune_interval", 3000)
+    cfg.prune_frac = t.get("prune_frac", 0.10)
+    cfg.route_start = t.get("route_start", 52000)
+    cfg.route_target_sparsity = float(t.get("route_target_sparsity", 0.5))
+    cfg.route_warmup = t.get("route_warmup", 5000)
+    cfg.route_l1_weight = float(t.get("route_l1_weight", 0.01))
+    return cfg
 
 
 # ─── Checkpointing ────────────────────────────────────────────────────────────
@@ -353,6 +370,15 @@ def train(cfg: InteropConfig, args):
                 "use_mtp": cfg.use_mtp,
                 "mtp_n_heads": cfg.mtp_n_heads if cfg.use_mtp else None,
                 "mtp_lambda": cfg.mtp_lambda if cfg.use_mtp else None,
+                "enable_pruning": cfg.enable_pruning,
+                "tile_size": cfg.tile_size if cfg.enable_pruning else None,
+                "prune_start": cfg.prune_start if cfg.enable_pruning else None,
+                "prune_end": cfg.prune_end if cfg.enable_pruning else None,
+                "prune_interval": cfg.prune_interval if cfg.enable_pruning else None,
+                "prune_frac": cfg.prune_frac if cfg.enable_pruning else None,
+                "enable_routing": cfg.enable_routing,
+                "n_clusters": cfg.n_clusters if cfg.enable_routing else None,
+                "route_start": cfg.route_start if cfg.enable_routing else None,
                 "framework": "pytorch",
             },
         )
@@ -371,6 +397,27 @@ def train(cfg: InteropConfig, args):
 
     # AMP scaler for bf16
     use_amp = device.type == "cuda"
+
+    # ─── Pruning / routing state ────────────────────────────────────────────
+    prunable_mods = model.get_prunable_modules() if cfg.enable_pruning else []
+    prune_round = 0
+    current_density = 1.0
+    routing_active = False
+    routed_blocks = []
+
+    if prunable_mods:
+        total_tiles = sum(m.R * m.C for _, _, m in prunable_mods)
+        print(f"  Prunable modules: {len(prunable_mods)} ({total_tiles:,} tiles, "
+              f"tile_size={cfg.tile_size})")
+        max_rounds = (cfg.prune_end - cfg.prune_start) // max(cfg.prune_interval, 1)
+        target_density = (1 - cfg.prune_frac) ** max_rounds
+        print(f"  Prune schedule: steps {cfg.prune_start}→{cfg.prune_end}, "
+              f"{cfg.prune_frac:.0%}/round every {cfg.prune_interval} steps, "
+              f"{max_rounds} rounds → ~{target_density:.1%} target density")
+        if cfg.enable_routing:
+            print(f"  Routing: ReMoE at step {cfg.route_start}, "
+                  f"{cfg.n_clusters} clusters, "
+                  f"target_sparsity={cfg.route_target_sparsity}")
 
     # Train
     print(f"\nTraining: steps {start_step} -> {cfg.total_steps}")
@@ -405,11 +452,135 @@ def train(cfg: InteropConfig, args):
             loss = out["loss"]
 
         loss.backward()
+
+        # ─── CMS: accumulate scores (BETWEEN backward and optimizer step) ───
+        if prunable_mods and step <= cfg.prune_end:
+            for _, _, mod in prunable_mods:
+                mod.accumulate_scores()
+
         torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
         optimizer.step()
 
+        # ─── Re-zero dead tiles (optimizer momentum can resurrect them) ───
+        if prune_round > 0 and not routing_active:
+            for _, _, mod in prunable_mods:
+                mod.rezero_dead()
+
         if cfg.use_outer_ssm and out.get("outer_state_out") is not None:
             outer_state = out["outer_state_out"].detach()
+
+        # ─── Phase logic ─────────────────────────────────────────────────────
+        if cfg.enable_pruning:
+            # Gradual pruning
+            if (prunable_mods and cfg.prune_start < step <= cfg.prune_end
+                    and (step - cfg.prune_start) % cfg.prune_interval == 0):
+                prune_round += 1
+                total_killed = 0
+                total_alive_before = 0
+                for i, (ci, name, mod) in enumerate(prunable_mods):
+                    killed, was_alive, density = mod.prune_fraction(cfg.prune_frac)
+                    total_killed += killed
+                    total_alive_before += was_alive
+                current_density = sum(
+                    m.density for _, _, m in prunable_mods
+                ) / len(prunable_mods)
+                print(f"  PRUNE R{prune_round} @ step {step}: killed {total_killed} tiles, "
+                      f"density={current_density:.1%}")
+                wandb.log({
+                    "prune/round": prune_round,
+                    "prune/density": current_density,
+                    "prune/tiles_killed": total_killed,
+                }, step=step)
+
+            # Compaction at prune_end
+            if step == cfg.prune_end and prune_round > 0:
+                print(f"\n  ═══ COMPACTING at step {step} (density={current_density:.1%}) ═══")
+                n_clusters = cfg.n_clusters if cfg.enable_routing else None
+                for ci, name, mod in prunable_mods:
+                    K_new = mod.compact(n_clusters=n_clusters)
+                    print(f"    core[{ci}].{name}: K {mod.C} → {K_new} "
+                          f"({K_new/mod.C:.1%} density)")
+
+                # Rebuild optimizer (parameter shapes changed)
+                if cfg.use_neural_memory:
+                    mem_mlp_ids = {id(p) for p in model.neural_memory.memory_mlp.parameters()}
+                    outer_params = [p for p in model.parameters()
+                                    if id(p) not in mem_mlp_ids and p.requires_grad]
+                else:
+                    outer_params = [p for p in model.parameters() if p.requires_grad]
+                optimizer = torch.optim.AdamW(
+                    outer_params, lr=lr, betas=(0.9, 0.95),
+                    weight_decay=cfg.weight_decay, eps=1e-8,
+                )
+
+                # Recompile (parameter shapes changed)
+                torch._dynamo.reset()
+                gc.collect()
+                torch.cuda.empty_cache()
+                try:
+                    compiled_model = torch.compile(model)
+                    print("  torch.compile re-enabled after compaction")
+                except Exception as e:
+                    print(f"  torch.compile failed ({e}), using eager")
+                    compiled_model = model
+
+                n_params = sum(p.numel() for p in model.parameters())
+                mem_gb = torch.cuda.memory_allocated() / 1e9
+                print(f"  Post-compact: {n_params/1e6:.1f}M params, {mem_gb:.1f}GB VRAM")
+                print(f"  ═══ COMPACTION COMPLETE ═══\n")
+
+            # ReMoE routing activation
+            if cfg.enable_routing and step == cfg.route_start and not routing_active:
+                print(f"\n  ═══ ACTIVATING ReMoE ROUTING at step {step} ═══")
+                # Import and create ReMoE routers for each core block's MLP
+                from titans_core.routing.remoe_router import ReMoERouter
+
+                for i, blk in enumerate(model.core):
+                    mlp = blk.mlp
+                    if not (hasattr(mlp, 'prunable') and mlp.prunable):
+                        continue
+                    gate_mod = mlp.w_gate
+                    if not gate_mod._compacted:
+                        print(f"  WARNING: core[{i}] not compacted, skipping routing")
+                        continue
+                    n_cl = gate_mod.n_clusters
+                    d_in = cfg.d_model
+                    router = ReMoERouter(d_in, n_cl, d_query=min(256, d_in),
+                                         target_sparsity=cfg.route_target_sparsity)
+                    router = router.to(device)
+                    mlp.router = router
+                    routed_blocks.append(mlp)
+
+                # Add router params to optimizer
+                if routed_blocks:
+                    router_params = []
+                    for rb in routed_blocks:
+                        router_params.extend(list(rb.router.parameters()))
+                    optimizer.add_param_group({
+                        "params": router_params,
+                        "lr": lr,
+                        "weight_decay": 0.0,
+                    })
+                    n_rp = sum(p.numel() for p in router_params)
+                    print(f"  Router params: {n_rp:,}")
+
+                routing_active = True
+                print(f"  ═══ ROUTING ACTIVE ═══\n")
+
+        # Determine phase label
+        if cfg.enable_pruning:
+            if step <= cfg.prune_start:
+                phase_label = "DENSE"
+            elif step <= cfg.prune_end:
+                phase_label = f"PRUNE R{prune_round}"
+            elif step < getattr(cfg, 'route_start', cfg.total_steps + 1):
+                phase_label = "SETTLE"
+            elif routing_active:
+                phase_label = "ROUTE"
+            else:
+                phase_label = "POST"
+        else:
+            phase_label = ""
 
         # Logging
         if step % LOG_INTERVAL == 0:
@@ -418,18 +589,22 @@ def train(cfg: InteropConfig, args):
             elapsed = time.time() - t0
             sps = (step - start_step + 1) / elapsed if elapsed > 0 else 0
             eta_min = (cfg.total_steps - step) / max(sps, 0.01) / 60
+            density_str = f" d={current_density:.2f}" if cfg.enable_pruning and current_density < 1.0 else ""
+            phase_str = f" [{phase_label}]" if phase_label else ""
             if use_amp:
                 mem_gb = torch.cuda.max_memory_allocated() / 1e9
-                print(f"  step {step:6d} | loss {loss_val:.4f} | ppl {ppl:7.1f} | "
-                      f"{sps:.1f} step/s | {mem_gb:.1f}GB | eta {eta_min:.0f}m")
+                print(f"  step {step:6d}{phase_str} | loss {loss_val:.4f} | ppl {ppl:7.1f} | "
+                      f"{sps:.1f} step/s | {mem_gb:.1f}GB{density_str} | eta {eta_min:.0f}m")
             else:
-                print(f"  step {step:6d} | loss {loss_val:.4f} | ppl {ppl:7.1f} | "
-                      f"{sps:.1f} step/s | eta {eta_min:.0f}m")
+                print(f"  step {step:6d}{phase_str} | loss {loss_val:.4f} | ppl {ppl:7.1f} | "
+                      f"{sps:.1f} step/s{density_str} | eta {eta_min:.0f}m")
             sys.stdout.flush()
             log_dict = {
                 "train/loss": loss_val, "train/ppl": ppl,
                 "train/lr": lr, "perf/steps_per_s": sps,
             }
+            if cfg.enable_pruning:
+                log_dict["train/density"] = current_density
             # Memory stats
             if cfg.use_neural_memory:
                 if out.get("memory_loss") is not None:

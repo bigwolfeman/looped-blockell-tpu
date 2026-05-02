@@ -1,0 +1,90 @@
+# 70k-step full pipeline: Dense → Prune → Compact → Settle → ReMoE
+# FULL PREFLIGHT: All architecture features enabled
+#
+# Schedule:
+#   0-10k:   Dense training, CMS score accumulation
+#   10k-50k: Gradual pruning (10%/round every 3k steps = 13 rounds → ~25% density)
+#   50k:     Compaction (rebuild Block-ELL, new optimizer)
+#   50k-52k: Settle (stabilize after compaction)
+#   52k-70k: ReMoE routing (iteration-aware tile-group routing)
+#
+# Architecture: 3p+6c+3coda, d=512, SwiGLU d_ff=1376
+# Features: BELL+Parcae+CSA+GQA+SwiGLU+QKNorm+XSA+AttnRes+NeuralMem+ReMoE
+
+model:
+  d_model: 512
+  n_heads: 8
+  d_ff: 1376         # (8/3)*512 rounded to 16 for SwiGLU
+  n_prelude: 3
+  n_core: 6
+  n_coda: 3
+  vocab_size: 49152
+  max_seq_len: 1024
+  mean_depth: 6
+  max_depth: 8
+  use_poisson: true
+  init_decay: 0.447
+  embed_geometry: hybrid
+  lorentz_dim_fraction: 0.5
+
+  # Full stack uplifts
+  use_swiglu: true
+  use_qk_norm: true
+  n_kv_heads: 2      # GQA 4:1
+  use_xsa: true
+
+  # CSA (DeepSeek-style compressed sparse attention)
+  use_sparse_attention: true
+  sparse_attn_type: csa
+  csa_compress_ratio: 8
+  csa_compress_stride: 4
+  csa_window_size: 128
+  sparse_attn_n_indexer_heads: 4
+
+  # Attention Residuals (online softmax — O(1) memory)
+  use_attn_res: true
+  attn_res_window: 0   # 0 = full (online softmax handles memory)
+
+  # Neural Memory (Titans, residual mode)
+  use_neural_memory: true
+  n_memory_layers: 4       # 4 layers, d=1024 → ~3.1M params
+  d_memory: 1024
+  memory_mode: residual
+  memory_theta_lr: 0.01
+  memory_alpha_min: 0.0001
+  memory_alpha_max: 0.003
+  memory_surprise_scale: 3.0
+  memory_eta_fixed: 0.95
+  use_sigreg: false
+  memory_inner_steps: 1
+  memory_warmup_steps: 1000
+  memory_ramp_steps: 4000
+  memory_update_interval: 5   # update MLP every 5 steps (retrieve every step)
+
+  # Block-ELL pruning (core blocks only)
+  enable_pruning: true
+  tile_size: 16
+
+  # ReMoE routing (after compaction)
+  enable_routing: true
+  n_clusters: 16
+
+training:
+  lr: 0.0006
+  weight_decay: 0.1
+  warmup_steps: 500
+  total_steps: 70000
+  batch_size: 20
+  grad_clip: 1.0
+
+  # Pruning schedule
+  prune_start: 10000
+  prune_end: 50000
+  prune_interval: 3000   # 13 rounds: (50k-10k)/3k = 13.3, 0.9^13 ≈ 25.4%
+  prune_frac: 0.10
+
+  # Routing schedule
+  route_start: 52000     # 2k settle steps after compaction
+  route_target_sparsity: 0.5
+  route_warmup: 5000
+  route_l1_weight: 0.01

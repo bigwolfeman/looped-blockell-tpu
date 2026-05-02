@@ -92,12 +92,19 @@ class InteropConfig:
     memory_inner_steps: int = 1    # K inner gradient steps per forward pass
     memory_warmup_steps: int = 1000  # steps before memory activates
     memory_ramp_steps: int = 4000    # steps to linearly ramp memory from 0→1
+    memory_update_interval: int = 1  # update MLP every N steps (retrieve every step)
     # SwiGLU activation (LLaMA-style)
     use_swiglu: bool = False
     # Multi-Token Prediction (arXiv:2404.19737)
     use_mtp: bool = False
     mtp_n_heads: int = 3    # predict t+1, t+2, t+3 (3 total)
     mtp_lambda: float = 0.1  # weight for auxiliary MTP losses
+    # Block-ELL pruning (core blocks only)
+    enable_pruning: bool = False
+    tile_size: int = 16
+    # ReMoE routing (after compaction)
+    enable_routing: bool = False
+    n_clusters: int = 16
     # CSA attention
     use_sparse_attention: bool = False
     sparse_attn_type: str = "csa"
@@ -460,26 +467,43 @@ class MultiHeadAttention(nn.Module):
             k = torch.cat([mem_k, k], dim=2)
             v = torch.cat([mem_v, v], dim=2)
 
+        # Fast path: SDPA with fused kernel (no append tokens, handles GQA natively)
+        if N_mem == 0 and not self.use_xsa:
+            drop_p = self.dropout if (not deterministic and self.dropout > 0) else 0.0
+            if self.kv_groups > 1 and cached_kv is None:
+                # GQA: undo the repeat_interleave, let SDPA handle it
+                k_gqa = k[:, ::self.kv_groups]
+                v_gqa = v[:, ::self.kv_groups]
+                out = F.scaled_dot_product_attention(
+                    q, k_gqa, v_gqa, is_causal=True, dropout_p=drop_p,
+                    enable_gqa=True,
+                )
+            else:
+                out = F.scaled_dot_product_attention(
+                    q, k, v, is_causal=True, dropout_p=drop_p,
+                )
+            out = out.transpose(1, 2).reshape(B, S, D)
+            return self.out_proj(out)
+
+        # Slow path: manual attention (append tokens or XSA)
         scale = math.sqrt(self.head_dim)
         S_kv = k.shape[2]
-        attn = torch.matmul(q, k.transpose(-2, -1)) / scale  # [B, H, S, N+S]
+        attn = torch.matmul(q, k.transpose(-2, -1)) / scale
 
-        # Causal mask: memory tokens (first N_mem) are always visible
         mask = torch.triu(
             torch.full((S, S_kv), float("-inf"), device=x.device, dtype=x.dtype),
             diagonal=1 + N_mem,
         )
         if N_mem > 0:
-            mask[:, :N_mem] = 0.0  # memory tokens visible to all positions
+            mask[:, :N_mem] = 0.0
         attn = attn + mask.unsqueeze(0).unsqueeze(0)
         attn = F.softmax(attn.float(), dim=-1).to(x.dtype)
 
         if self.dropout > 0.0 and not deterministic:
             attn = F.dropout(attn, p=self.dropout, training=True)
 
-        out = torch.matmul(attn, v)  # [B, H, S, d_head]
+        out = torch.matmul(attn, v)
 
-        # XSA: subtract projection onto own value vector (arXiv:2603.09078)
         if self.use_xsa:
             v_norm_sq = (v * v).sum(-1, keepdim=True).clamp(min=1e-8)
             proj = (out * v).sum(-1, keepdim=True) / v_norm_sq
@@ -489,12 +513,185 @@ class MultiHeadAttention(nn.Module):
         return self.out_proj(out)
 
 
+class PrunableLinear(nn.Module):
+    """Linear layer with 16x16 tile-level pruning + Block-ELL compaction.
+
+    Pre-compact: dense weight [out, in] with tile mask. O(out*in) compute.
+    Post-compact: Block-ELL [R, K_new, B, B] with col_indices. O(R*K_new*B^2) compute.
+    """
+
+    def __init__(self, in_features: int, out_features: int, tile_size: int = 16, bias: bool = False):
+        super().__init__()
+        assert in_features % tile_size == 0 and out_features % tile_size == 0
+        self.in_features = in_features
+        self.out_features = out_features
+        self.tile_size = tile_size
+        self.R = out_features // tile_size
+        self.C = in_features // tile_size
+
+        self.weight = nn.Parameter(torch.empty(out_features, in_features))
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        if bias:
+            self.bias = nn.Parameter(torch.zeros(out_features))
+        else:
+            self.register_parameter("bias", None)
+
+        self.register_buffer("tile_mask", torch.ones(self.R, self.C, dtype=torch.bool))
+        self.register_buffer("score_ema", torch.zeros(self.R, self.C))
+        self._compacted = False
+        self._all_alive = True
+        self._mask_expanded: Tensor | None = None
+
+    def _expand_mask(self) -> Tensor:
+        if self._mask_expanded is None:
+            B = self.tile_size
+            self._mask_expanded = (
+                self.tile_mask.float()
+                .unsqueeze(1).unsqueeze(3)
+                .expand(self.R, B, self.C, B)
+                .reshape(self.out_features, self.in_features)
+            )
+        return self._mask_expanded
+
+    def forward(self, x: Tensor) -> Tensor:
+        if self._compacted:
+            return self._forward_bell(x)
+        if self._all_alive:
+            return F.linear(x, self.weight, self.bias)
+        return F.linear(x, self.weight * self._expand_mask(), self.bias)
+
+    def _forward_bell(self, x: Tensor) -> Tensor:
+        squeezed = x.dim() == 2
+        if squeezed:
+            x = x.unsqueeze(1)
+        Bsz, S, _ = x.shape
+        B = self.tile_size
+        x_blocks = x.reshape(Bsz, S, self.C, B)
+        x_gathered = x_blocks[:, :, self.col_indices.long(), :]
+        out = torch.einsum("bsrki,rkoi->bsrko", x_gathered, self.values)
+        out = out.sum(dim=3).reshape(Bsz, S, self.out_features)
+        if self.bias is not None:
+            out = out + self.bias
+        if squeezed:
+            out = out.squeeze(1)
+        return out
+
+    def accumulate_scores(self):
+        if self.weight.grad is None or self._compacted:
+            return
+        B = self.tile_size
+        grad_tiles = self.weight.grad.detach().reshape(self.R, B, self.C, B)
+        tile_norms = grad_tiles.pow(2).sum(dim=(1, 3)).sqrt()
+        with torch.no_grad():
+            self.score_ema.lerp_(tile_norms, 0.05)
+
+    def prune_fraction(self, frac: float) -> tuple[int, int, float]:
+        """Kill bottom frac of alive tiles. Returns (killed, was_alive, new_density)."""
+        with torch.no_grad():
+            alive = self.tile_mask
+            n_alive = alive.sum().item()
+            n_total = self.R * self.C
+            if n_alive <= 1:
+                return 0, n_alive, n_alive / n_total
+
+            scores = self.score_ema.clone()
+            scores[~alive] = float('inf')
+            n_kill = max(1, int(n_alive * frac))
+            n_kill = min(n_kill, n_alive - 1)
+
+            threshold = scores[alive].topk(n_alive, largest=False).values[n_kill - 1]
+            kill = alive & (scores <= threshold)
+            actual_killed = kill.sum().item()
+            if actual_killed > n_kill:
+                indices = kill.nonzero()
+                keep = indices[n_kill:]
+                for idx in keep:
+                    kill[idx[0], idx[1]] = False
+                actual_killed = n_kill
+
+            self.tile_mask[kill] = False
+            self._all_alive = False
+            self._mask_expanded = None
+
+            mask_exp = self._expand_mask()
+            self.weight.data *= mask_exp
+
+            new_alive = self.tile_mask.sum().item()
+            return actual_killed, n_alive, new_alive / n_total
+
+    def rezero_dead(self):
+        if self._compacted or self._all_alive:
+            return
+        with torch.no_grad():
+            self.weight.data *= self._expand_mask()
+
+    @property
+    def density(self) -> float:
+        if self._compacted:
+            return self._compact_density
+        return self.tile_mask.float().mean().item()
+
+    def compact(self, n_clusters: int | None = None) -> int:
+        """Rebuild as Block-ELL with compacted K. Returns K_new."""
+        with torch.no_grad():
+            B = self.tile_size
+            alive = self.tile_mask
+            alive_per_row = alive.sum(dim=1)
+            K_new = max(1, int(alive_per_row.min().item()))
+
+            scores = self.score_ema.clone()
+            scores[~alive] = -float('inf')
+            _, top_idx = scores.topk(K_new, dim=1, largest=True)
+
+            col_indices = torch.zeros(self.R, K_new, dtype=torch.int32,
+                                      device=self.weight.device)
+            values = torch.zeros(self.R, K_new, B, B,
+                                 device=self.weight.device, dtype=self.weight.dtype)
+            w_tiles = self.weight.reshape(self.R, B, self.C, B).permute(0, 2, 1, 3)
+
+            for r in range(self.R):
+                for k_new, k_old in enumerate(top_idx[r]):
+                    col_indices[r, k_new] = k_old.to(torch.int32)
+                    values[r, k_new] = w_tiles[r, k_old]
+
+            del self._parameters["weight"]
+            self.values = nn.Parameter(values)
+            self.register_buffer("col_indices", col_indices)
+            self._compacted = True
+            self._compact_density = K_new / self.C
+            self.K = K_new
+
+            if n_clusters is not None:
+                rows_per = self.R // n_clusters
+                remainder = self.R % n_clusters
+                starts, ends = [], []
+                row = 0
+                for c in range(n_clusters):
+                    starts.append(row)
+                    row += rows_per + (1 if c < remainder else 0)
+                    ends.append(row)
+                self.n_clusters = n_clusters
+                self.register_buffer("cluster_starts",
+                                     torch.tensor(starts, dtype=torch.int32))
+                self.register_buffer("cluster_ends",
+                                     torch.tensor(ends, dtype=torch.int32))
+
+            return K_new
+
+
 class MLPBlock(nn.Module):
-    def __init__(self, cfg: InteropConfig):
+    def __init__(self, cfg: InteropConfig, prunable: bool = False):
         super().__init__()
         self.use_swiglu = getattr(cfg, 'use_swiglu', False)
         self.dropout = cfg.dropout
-        if self.use_swiglu:
+        self.prunable = prunable and cfg.enable_pruning
+
+        if self.prunable and self.use_swiglu:
+            B = cfg.tile_size
+            self.w_gate = PrunableLinear(cfg.d_model, cfg.d_ff, B, bias=False)
+            self.w_up = PrunableLinear(cfg.d_model, cfg.d_ff, B, bias=False)
+            self.w_down = PrunableLinear(cfg.d_ff, cfg.d_model, B, bias=False)
+        elif self.use_swiglu:
             self.w_gate = nn.Linear(cfg.d_model, cfg.d_ff, bias=False)
             self.w_up = nn.Linear(cfg.d_model, cfg.d_ff, bias=False)
             self.w_down = nn.Linear(cfg.d_ff, cfg.d_model, bias=False)
@@ -513,7 +710,7 @@ class MLPBlock(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, cfg: InteropConfig):
+    def __init__(self, cfg: InteropConfig, prunable: bool = False):
         super().__init__()
         self.norm_attn = RMSNorm(cfg.d_model, cfg.norm_eps)
         if cfg.use_sparse_attention and cfg.sparse_attn_type == "csa":
@@ -521,13 +718,17 @@ class TransformerBlock(nn.Module):
         else:
             self.attention = MultiHeadAttention(cfg)
         self.norm_mlp = RMSNorm(cfg.d_model, cfg.norm_eps)
-        self.mlp = MLPBlock(cfg)
+        self.mlp = MLPBlock(cfg, prunable=prunable)
 
     def forward(self, x: Tensor, deterministic: bool = True,
                 memory_bias: Tensor | None = None,
                 cached_kv: tuple[Tensor, Tensor] | None = None) -> Tensor:
-        x = x + self.attention(self.norm_attn(x), deterministic,
-                               memory_bias=memory_bias, cached_kv=cached_kv)
+        if cached_kv is not None and isinstance(self.attention, MultiHeadAttention):
+            x = x + self.attention(self.norm_attn(x), deterministic,
+                                   memory_bias=memory_bias, cached_kv=cached_kv)
+        else:
+            x = x + self.attention(self.norm_attn(x), deterministic,
+                                   memory_bias=memory_bias)
         x = x + self.mlp(self.norm_mlp(x), deterministic)
         return x
 
@@ -818,9 +1019,8 @@ class _DepthAttnFn(torch.autograd.Function):
 class AttentionResidual(nn.Module):
     """Depth-wise attention over block outputs (arXiv:2603.15031).
 
-    Triton fused forward + analytical backward via custom autograd.Function.
-    Zero-init queries for uniform initial attention (paper spec).
-    Single autograd node per call — eliminates graph traversal overhead.
+    Triton fused forward + analytical backward via _DepthAttnFn.
+    Single autograd node per call — no graph explosion from stacking entries.
     """
     def __init__(self, d_model: int, max_blocks: int):
         super().__init__()
@@ -833,7 +1033,7 @@ class AttentionResidual(nn.Module):
         self._entries = []
 
     def append(self, h: Tensor):
-        self._entries.append(h)
+        self._entries.append(h.detach())
 
     def forward(self, block_idx: int, window: int = 0) -> Tensor:
         n = len(self._entries)
@@ -841,10 +1041,10 @@ class AttentionResidual(nn.Module):
             return self._entries[0]
         w = self.proj[min(block_idx, self.max_blocks - 1)]
         V = torch.stack(self._entries, dim=0)  # [n, B, S, D]
-        K = self.norm(V)
-        logits = torch.einsum("d, nbsd -> nbs", w, K)
-        weights = F.softmax(logits, dim=0)
-        return torch.einsum("nbs, nbsd -> bsd", weights, V)
+        N, Bsz, S, D = V.shape
+        V_flat = V.reshape(N, Bsz * S, D).contiguous()
+        out = _DepthAttnFn.apply(V_flat, self.norm.scale, w, N)
+        return out.reshape(Bsz, S, D)
 
 
 # ─── SIGReg (anti-collapse regularization for memory outputs) ────────────────
@@ -915,9 +1115,9 @@ class LoopedTransformerPT(nn.Module):
         if cfg.use_outer_ssm:
             self.outer_injection = DiagonalInjection(cfg.d_model, cfg.outer_init_decay)
 
-        # 5. Core blocks (shared across loop iterations)
+        # 5. Core blocks (shared across loop iterations, prunable when enabled)
         self.core = nn.ModuleList([
-            TransformerBlock(cfg) for _ in range(cfg.n_core)
+            TransformerBlock(cfg, prunable=True) for _ in range(cfg.n_core)
         ])
 
         # 6. Iteration embedding (Phase C routing)
@@ -1054,8 +1254,6 @@ class LoopedTransformerPT(nn.Module):
         for t in range(total_iters):
             if use_hc:
                 h_agg = self.loop_hc.aggregate(streams)
-            elif use_ar:
-                h_agg = self.attn_res(ar_idx, window=cfg.attn_res_window)
             else:
                 h_agg = h
 
@@ -1135,16 +1333,18 @@ class LoopedTransformerPT(nn.Module):
         h_final = h
 
         # 7b. Neural memory: K inner gradient steps on h_final
+        #     Retrieve every step, but update MLP weights every N steps
         memory_loss = None
         sigreg_val = None
         if use_mem:
-            # Detach: inner loop doesn't need outer graph (memory_loss not in outer loss)
-            h_for_mem = h_final.detach()
-            for _ in range(cfg.memory_inner_steps):
-                memory_loss = self.neural_memory.update(
-                    h_for_mem, return_stats=False,
-                    differentiable=cfg.use_differentiable_memory,
-                )
+            should_update = (step % cfg.memory_update_interval == 0)
+            if should_update:
+                h_for_mem = h_final.detach()
+                for _ in range(cfg.memory_inner_steps):
+                    memory_loss = self.neural_memory.update(
+                        h_for_mem, return_stats=False,
+                        differentiable=cfg.use_differentiable_memory,
+                    )
             if cfg.use_sigreg:
                 mem_check = self.neural_memory.retrieve(h_final)
                 sigreg_val = sigreg_loss(mem_check)
@@ -1159,20 +1359,40 @@ class LoopedTransformerPT(nn.Module):
 
         # 9. Final norm + LM head (weight-tied)
         x = self.final_norm(x)
-        if self.embed_geometry in ("lorentz", "hybrid"):
-            logits = self.embed.attend(x)
-        else:
-            logits = F.linear(x, self.embed.weight)  # [B, S, vocab_size]
 
-        # 10. Loss
+        # 10. Loss — chunked CE to avoid materializing full [B*S, V] logits
         loss = None
         mtp_loss = None
+        logits = None
         if labels is not None:
-            task_loss = F.cross_entropy(
-                logits.reshape(-1, cfg.vocab_size),
-                labels.reshape(-1),
-            )
+            n_chunks = max(1, (B * S * cfg.vocab_size * 4) // (1 << 30))  # ~1GB per chunk
+            if n_chunks <= 1:
+                if self.embed_geometry in ("lorentz", "hybrid"):
+                    logits = self.embed.attend(x)
+                else:
+                    logits = F.linear(x, self.embed.weight)
+                task_loss = F.cross_entropy(logits.reshape(-1, cfg.vocab_size), labels.reshape(-1))
+            else:
+                x_chunks = x.chunk(n_chunks, dim=1)
+                l_chunks = labels.chunk(n_chunks, dim=1)
+                ce_sum = torch.tensor(0.0, device=x.device, dtype=torch.float32)
+                total_tokens = 0
+                for xc, lc in zip(x_chunks, l_chunks):
+                    if self.embed_geometry in ("lorentz", "hybrid"):
+                        lgt = self.embed.attend(xc)
+                    else:
+                        lgt = F.linear(xc, self.embed.weight)
+                    ce_sum = ce_sum + F.cross_entropy(
+                        lgt.reshape(-1, cfg.vocab_size), lc.reshape(-1), reduction='sum')
+                    total_tokens += lc.numel()
+                task_loss = ce_sum / total_tokens
+                logits = None  # not needed for training
             loss = task_loss
+        else:
+            if self.embed_geometry in ("lorentz", "hybrid"):
+                logits = self.embed.attend(x)
+            else:
+                logits = F.linear(x, self.embed.weight)
 
             # MTP: auxiliary losses for predicting t+2, t+3, ...
             if cfg.use_mtp:
@@ -1210,6 +1430,18 @@ class LoopedTransformerPT(nn.Module):
             "mtp_loss": mtp_loss,
             "sigreg_loss": sigreg_val,
         }
+
+    def get_prunable_modules(self) -> list[tuple[int, str, PrunableLinear]]:
+        """Return (core_idx, name, module) for all PrunableLinear in core blocks."""
+        mods = []
+        for i, blk in enumerate(self.core):
+            mlp = blk.mlp
+            if hasattr(mlp, 'prunable') and mlp.prunable:
+                for name in ("w_gate", "w_up", "w_down"):
+                    m = getattr(mlp, name, None)
+                    if isinstance(m, PrunableLinear):
+                        mods.append((i, name, m))
+        return mods
 
 
 # ─── Depth sampling (mirrors JAX depth_sampler.py) ─────────────────────────
