@@ -347,6 +347,8 @@ def train(cfg: InteropConfig, args):
     # Resume
     start_step = 0
     outer_state = None
+    prune_round = 0
+    current_density = 1.0
     if cfg.use_outer_ssm:
         outer_state = torch.zeros(cfg.batch_size, cfg.max_seq_len, cfg.d_model,
                                   device=device, dtype=torch.bfloat16)
@@ -416,9 +418,8 @@ def train(cfg: InteropConfig, args):
     use_amp = device.type == "cuda"
 
     # ─── Pruning / routing state ────────────────────────────────────────────
+    # prune_round and current_density are set by load_checkpoint (or defaults above)
     prunable_mods = model.get_prunable_modules() if cfg.enable_pruning else []
-    prune_round = 0
-    current_density = 1.0
     routing_active = False
     routed_blocks = []
 
