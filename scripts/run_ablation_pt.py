@@ -150,16 +150,18 @@ def _ckpt_dir(name: str) -> Path:
     return d
 
 
-def save_checkpoint(name: str, step: int, model, optimizer, outer_state=None):
+def save_checkpoint(name: str, step: int, model, optimizer, outer_state=None,
+                    prune_round: int = 0, current_density: float = 1.0):
     d = _ckpt_dir(name)
     ckpt = {
         "step": step,
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
+        "prune_round": prune_round,
+        "current_density": current_density,
     }
     if outer_state is not None:
         ckpt["outer_state"] = outer_state.detach().cpu()
-    # Memory state is included in model.state_dict() (MLP weights + momentum buffer)
     tmp = d / "ckpt_tmp.pt"
     final = d / "ckpt.pt"
     torch.save(ckpt, tmp)
@@ -177,8 +179,23 @@ def load_checkpoint(name: str, model, optimizer, device):
     outer = ckpt.get("outer_state")
     if outer is not None:
         outer = outer.to(device)
-    print(f"  Resumed from step {ckpt['step']}")
-    return ckpt["step"], outer
+    prune_round = ckpt.get("prune_round", -1)
+    current_density = ckpt.get("current_density", -1.0)
+    if prune_round < 0:
+        # Legacy checkpoint: infer from step and tile masks
+        step = ckpt["step"]
+        sd = ckpt["model_state_dict"]
+        masks = [v for k, v in sd.items() if "tile_mask" in k and "core" in k]
+        if masks:
+            total_alive = sum(m.sum().item() for m in masks)
+            total_tiles = sum(m.numel() for m in masks)
+            current_density = total_alive / total_tiles
+        else:
+            current_density = 1.0
+        prune_round = max(0, round(math.log(current_density) / math.log(0.9))) if current_density < 1.0 else 0
+    print(f"  Resumed from step {ckpt['step']} "
+          f"(prune_round={prune_round}, density={current_density:.1%})")
+    return ckpt["step"], outer, prune_round, current_density
 
 
 # ─── Data ──────────────────────────────────────────────────────────────────────
@@ -336,7 +353,7 @@ def train(cfg: InteropConfig, args):
 
     ckpt = load_checkpoint(args.name, model, optimizer, device)
     if ckpt is not None:
-        start_step, ckpt_outer = ckpt
+        start_step, ckpt_outer, prune_round, current_density = ckpt
         if ckpt_outer is not None:
             outer_state = ckpt_outer
 
@@ -506,13 +523,35 @@ def train(cfg: InteropConfig, args):
             # Compaction at prune_end
             if step == cfg.prune_end and prune_round > 0:
                 print(f"\n  ═══ COMPACTING at step {step} (density={current_density:.1%}) ═══")
+                mem_pre = torch.cuda.memory_allocated() / 1e9
+
+                # 1. Delete old optimizer FIRST — releases references to old params
+                del optimizer
+                gc.collect()
+                torch.cuda.empty_cache()
+
+                # 2. Delete old compiled graph — holds references to old tensors
+                del compiled_model
+                torch._dynamo.reset()
+                gc.collect()
+                torch.cuda.empty_cache()
+
+                mem_after_dealloc = torch.cuda.memory_allocated() / 1e9
+                print(f"  Pre-compact dealloc: {mem_pre:.1f}GB → {mem_after_dealloc:.1f}GB "
+                      f"(freed {mem_pre - mem_after_dealloc:.1f}GB)")
+
+                # 3. Compact all prunable modules
                 n_clusters = cfg.n_clusters if cfg.enable_routing else None
                 for ci, name, mod in prunable_mods:
                     K_new = mod.compact(n_clusters=n_clusters)
                     print(f"    core[{ci}].{name}: K {mod.C} → {K_new} "
                           f"({K_new/mod.C:.1%} density)")
 
-                # Rebuild optimizer (parameter shapes changed)
+                # 4. Force dealloc of old weight tensors now that compact replaced them
+                gc.collect()
+                torch.cuda.empty_cache()
+
+                # 5. Rebuild optimizer with new (compacted) parameters
                 if cfg.use_neural_memory:
                     mem_mlp_ids = {id(p) for p in model.neural_memory.memory_mlp.parameters()}
                     outer_params = [p for p in model.parameters()
@@ -524,8 +563,7 @@ def train(cfg: InteropConfig, args):
                     weight_decay=cfg.weight_decay, eps=1e-8,
                 )
 
-                # Recompile (parameter shapes changed)
-                torch._dynamo.reset()
+                # 6. Recompile with new parameter shapes
                 gc.collect()
                 torch.cuda.empty_cache()
                 try:
@@ -639,7 +677,8 @@ def train(cfg: InteropConfig, args):
 
         # Checkpoint
         if step > 0 and step % CKPT_INTERVAL == 0:
-            save_checkpoint(args.name, step, model, optimizer, outer_state)
+            save_checkpoint(args.name, step, model, optimizer, outer_state,
+                           prune_round=prune_round, current_density=current_density)
 
     # Final eval + save
     val_loss = evaluate(model, eval_batches, cfg, device, outer_state)
@@ -649,7 +688,8 @@ def train(cfg: InteropConfig, args):
     wandb.summary.update({"final_val_ppl": val_ppl, "final_val_loss": val_loss,
                           "n_params": n_params})
 
-    save_checkpoint(args.name, cfg.total_steps, model, optimizer, outer_state)
+    save_checkpoint(args.name, cfg.total_steps, model, optimizer, outer_state,
+                   prune_round=prune_round, current_density=current_density)
     wandb.finish()
     print("Done.")
 
