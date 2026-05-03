@@ -92,8 +92,10 @@ def create_block_ell_from_dense(
     C = in_features // B
     K = max(1, int(C * density))
 
-    # Reshape into blocks: [R, C, B, B]
-    blocks = dense.reshape(R, B, C, B).transpose(0, 2, 1, 3)  # [R, C, B, B]
+    # Reshape into blocks: [R, C, B_in, B_out]
+    # The einsum "bsrkd,rkdD->bsrD" contracts d (input sub-idx) so
+    # values must be [R, K, B_in, B_out] (Flax [in, out] convention).
+    blocks = dense.reshape(R, B, C, B).transpose(0, 2, 3, 1)  # [R, C, B_in, B_out]
 
     # Frobenius norm per block [R, C]
     block_norms = jnp.sqrt(jnp.sum(blocks ** 2, axis=(2, 3)))
@@ -130,8 +132,8 @@ def block_ell_to_dense(block_ell: BlockELLTensor) -> jnp.ndarray:
             c = r_cols[k]
             row_s = r * B
             col_s = c * B
-            # dynamic_update_slice: (array, update, start_indices)
-            block = r_values[k]  # [B, B]
+            # values are [B_in, B_out], dense is [out, in] → transpose
+            block = r_values[k].T  # [B_in, B_out] → [B_out, B_in]
             d_inner = jax.lax.dynamic_update_slice(
                 d_inner, block, (row_s, col_s)
             )

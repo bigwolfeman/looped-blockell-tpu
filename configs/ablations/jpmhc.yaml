@@ -1,0 +1,7 @@
+# JPmHC: Cayley-orthogonal hyper-connections (arXiv:2602.18308)
+# Full n×n cross-stream mixing with orthogonal residual (norm-preserving)
+# Input-conditional per-token routing
+model:
+  use_loop_boundary_hc: true
+  hc_type: jpmhc
+  hc_n_streams: 4

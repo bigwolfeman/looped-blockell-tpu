@@ -1,0 +1,11 @@
+# Hybrid embeddings + TWEO regularization — 50k step long run
+# TWEO prevents extreme activation outliers, enabling future FP8 training
+model:
+  embed_geometry: hybrid
+  lorentz_dim_fraction: 0.5
+  use_tweo: true
+  tweo_tau: 3.0
+  tweo_p: 4
+  tweo_lambda: 0.01
+training:
+  total_steps: 50000
