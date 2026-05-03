@@ -526,57 +526,21 @@ def train(cfg: InteropConfig, args):
                 print(f"\n  ═══ COMPACTING at step {step} (density={current_density:.1%}) ═══")
                 mem_pre = torch.cuda.memory_allocated() / 1e9
 
-                # 1. Delete old optimizer FIRST — releases references to old params
-                del optimizer
-                gc.collect()
-                torch.cuda.empty_cache()
-
-                # 2. Delete old compiled graph — holds references to old tensors
-                del compiled_model
-                torch._dynamo.reset()
-                gc.collect()
-                torch.cuda.empty_cache()
-
-                mem_after_dealloc = torch.cuda.memory_allocated() / 1e9
-                print(f"  Pre-compact dealloc: {mem_pre:.1f}GB → {mem_after_dealloc:.1f}GB "
-                      f"(freed {mem_pre - mem_after_dealloc:.1f}GB)")
-
-                # 3. Compact all prunable modules
+                # Frozen-dense compaction: zero dead tiles permanently, keep
+                # dense weight. No shape change → no optimizer rebuild, no
+                # recompilation. cuBLAS at this scale beats any sparse repr.
                 n_clusters = cfg.n_clusters if cfg.enable_routing else None
                 for ci, name, mod in prunable_mods:
                     K_new = mod.compact(n_clusters=n_clusters)
-                    print(f"    core[{ci}].{name}: K {mod.C} → {K_new} "
-                          f"({K_new/mod.C:.1%} density)")
+                    alive = mod.tile_mask.sum().item()
+                    total = mod.R * mod.C
+                    print(f"    core[{ci}].{name}: K_eff={K_new}, "
+                          f"{alive}/{total} tiles alive ({alive/total:.1%})")
 
-                # 4. Force dealloc of old weight tensors now that compact replaced them
-                gc.collect()
-                torch.cuda.empty_cache()
-
-                # 5. Rebuild optimizer with new (compacted) parameters
-                if cfg.use_neural_memory:
-                    mem_mlp_ids = {id(p) for p in model.neural_memory.memory_mlp.parameters()}
-                    outer_params = [p for p in model.parameters()
-                                    if id(p) not in mem_mlp_ids and p.requires_grad]
-                else:
-                    outer_params = [p for p in model.parameters() if p.requires_grad]
-                optimizer = torch.optim.AdamW(
-                    outer_params, lr=lr, betas=(0.9, 0.95),
-                    weight_decay=cfg.weight_decay, eps=1e-8,
-                )
-
-                # 6. Recompile with new parameter shapes
-                gc.collect()
-                torch.cuda.empty_cache()
-                try:
-                    compiled_model = torch.compile(model)
-                    print("  torch.compile re-enabled after compaction")
-                except Exception as e:
-                    print(f"  torch.compile failed ({e}), using eager")
-                    compiled_model = model
-
-                n_params = sum(p.numel() for p in model.parameters())
-                mem_gb = torch.cuda.memory_allocated() / 1e9
-                print(f"  Post-compact: {n_params/1e6:.1f}M params, {mem_gb:.1f}GB VRAM")
+                mem_post = torch.cuda.memory_allocated() / 1e9
+                print(f"  VRAM: {mem_pre:.1f}GB → {mem_post:.1f}GB "
+                      f"(delta {mem_post - mem_pre:+.1f}GB)")
+                print(f"  Optimizer + compiled graph PRESERVED (no shape change)")
                 print(f"  ═══ COMPACTION COMPLETE ═══\n")
 
             # ReMoE routing activation

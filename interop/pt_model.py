@@ -41,6 +41,7 @@ if _repo_root not in sys.path:
     sys.path.insert(0, _repo_root)
 
 
+
 @dataclass
 class InteropConfig:
     d_model: int = 512
@@ -622,27 +623,14 @@ class PrunableLinear(nn.Module):
         return self._mask_expanded
 
     def forward(self, x: Tensor) -> Tensor:
-        if self._compacted:
-            return self._forward_bell(x)
         if self._all_alive:
             return F.linear(x, self.weight, self.bias)
-        return F.linear(x, self.weight * self._expand_mask(), self.bias)
-
-    def _forward_bell(self, x: Tensor) -> Tensor:
-        squeezed = x.dim() == 2
-        if squeezed:
-            x = x.unsqueeze(1)
-        Bsz, S, _ = x.shape
-        B = self.tile_size
-        x_blocks = x.reshape(Bsz, S, self.C, B)
-        x_gathered = x_blocks[:, :, self.col_indices.long(), :]
-        out = torch.einsum("bsrki,rkoi->bsrko", x_gathered, self.values)
-        out = out.sum(dim=3).reshape(Bsz, S, self.out_features)
-        if self.bias is not None:
-            out = out + self.bias
-        if squeezed:
-            out = out.squeeze(1)
-        return out
+        # Both pre-compact (masked) and post-compact (frozen dense) use F.linear.
+        # Post-compact: dead tiles are permanently zeroed but mask still needed
+        # to prevent gradient accumulation from reviving them.
+        mask = self._expand_mask()
+        w = self.weight * mask.to(self.weight.dtype)
+        return F.linear(x, w, self.bias)
 
     def accumulate_scores(self):
         if self.weight.grad is None or self._compacted:
@@ -700,31 +688,22 @@ class PrunableLinear(nn.Module):
         return self.tile_mask.float().mean().item()
 
     def compact(self, n_clusters: int | None = None) -> int:
-        """Rebuild as Block-ELL with compacted K. Returns K_new."""
+        """Freeze dead tiles and set up routing metadata. Returns K_new.
+
+        Uses "frozen dense" mode: keeps the weight as a dense parameter with
+        dead tiles permanently zeroed. At d_ff<=2048, dense cuBLAS GEMM is
+        faster than any sparse representation (Block-ELL, BMM, Triton).
+        The mask is retained to zero gradients for dead tiles each step.
+        """
         with torch.no_grad():
             B = self.tile_size
             alive = self.tile_mask
             alive_per_row = alive.sum(dim=1)
             K_new = max(1, int(alive_per_row.min().item()))
 
-            scores = self.score_ema.clone()
-            scores[~alive] = -float('inf')
-            _, top_idx = scores.topk(K_new, dim=1, largest=True)
+            # Permanently zero dead tiles in the weight
+            self.weight.data *= self._expand_mask()
 
-            col_indices = torch.zeros(self.R, K_new, dtype=torch.int32,
-                                      device=self.weight.device)
-            values = torch.zeros(self.R, K_new, B, B,
-                                 device=self.weight.device, dtype=self.weight.dtype)
-            w_tiles = self.weight.reshape(self.R, B, self.C, B).permute(0, 2, 1, 3)
-
-            for r in range(self.R):
-                for k_new, k_old in enumerate(top_idx[r]):
-                    col_indices[r, k_new] = k_old.to(torch.int32)
-                    values[r, k_new] = w_tiles[r, k_old]
-
-            del self._parameters["weight"]
-            self.values = nn.Parameter(values)
-            self.register_buffer("col_indices", col_indices)
             self._compacted = True
             self._compact_density = K_new / self.C
             self.K = K_new
