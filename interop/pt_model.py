@@ -1393,22 +1393,11 @@ class LoopedTransformerPT(nn.Module):
         # 7. Save h_final for outer SSM
         h_final = h
 
-        # 7b. Neural memory: K inner gradient steps on h_final
-        #     Retrieve every step, but update MLP weights every N steps
+        # 7b. Neural memory update moved to training loop (after backward)
+        #     to avoid @torch._dynamo.disable graph break inside compiled forward.
+        #     h_final is exposed in output dict for the training loop to call update().
         memory_loss = None
         sigreg_val = None
-        if use_mem:
-            should_update = (step % cfg.memory_update_interval == 0)
-            if should_update:
-                h_for_mem = h_final.detach()
-                for _ in range(cfg.memory_inner_steps):
-                    memory_loss = self.neural_memory.update(
-                        h_for_mem, return_stats=False,
-                        differentiable=cfg.use_differentiable_memory,
-                    )
-            if cfg.use_sigreg:
-                mem_check = self.neural_memory.retrieve(h_final)
-                sigreg_val = sigreg_loss(mem_check)
 
         # 8. Coda
         if use_ar:
@@ -1486,6 +1475,7 @@ class LoopedTransformerPT(nn.Module):
             "logits": logits,
             "loss": loss,
             "outer_state_out": h_final,
+            "h_final_for_memory": h_final.detach() if use_mem else None,
             "depth_meta": {"t_max": total_iters, "n_max": n_max, "k_max": k_max},
             "memory_loss": memory_loss,
             "mtp_loss": mtp_loss,

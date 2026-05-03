@@ -14,7 +14,7 @@ the full Titans Eq. 13-14 update as a single opaque kernel call:
 where M_t refers to the flat concatenation of all memory MLP weights.
 
 Usage:
-    import titan_kernels  # loads TORCH_LIBRARY registrations
+    torch.ops.load_library("csrc/titan_kernels.cpython-311-x86_64-linux-gnu.so")
     from csrc.neural_memory.neural_memory_wrapper import (
         fused_memory_update,
         fused_memory_retrieve,
@@ -120,6 +120,14 @@ def fused_memory_update(
     linears, n = _extract_linear_layers(memory_mlp)
     _assert_four_layers(n)
 
+    # Ensure MLP weights match input dtype (checkpoint may load as fp32)
+    dtype = keys.dtype
+    for l in linears:
+        if l.weight.dtype != dtype:
+            l.weight.data = l.weight.data.to(dtype)
+        if l.bias.dtype != dtype:
+            l.bias.data = l.bias.data.to(dtype)
+
     w0, w1, w2, w3 = linears[0].weight, linears[1].weight, linears[2].weight, linears[3].weight
     b0, b1, b2, b3 = linears[0].bias,   linears[1].bias,   linears[2].bias,   linears[3].bias
 
@@ -157,6 +165,14 @@ def fused_memory_retrieve(
     linears, n = _extract_linear_layers(memory_mlp)
     _assert_four_layers(n)
 
+    # Ensure MLP weights match query dtype (checkpoint may load as fp32)
+    dtype = query_norm.dtype
+    for l in linears:
+        if l.weight.dtype != dtype:
+            l.weight.data = l.weight.data.to(dtype)
+        if l.bias.dtype != dtype:
+            l.bias.data = l.bias.data.to(dtype)
+
     w0, w1, w2, w3 = linears[0].weight, linears[1].weight, linears[2].weight, linears[3].weight
     b0, b1, b2, b3 = linears[0].bias,   linears[1].bias,   linears[2].bias,   linears[3].bias
 
@@ -165,6 +181,12 @@ def fused_memory_retrieve(
         w0, w1, w2, w3,
         b0, b1, b2, b3,
     )
+
+
+@torch.compiler.disable
+def _compute_alpha_nograph(module, loss_proxy):
+    """Compute surprise alpha outside dynamo graph (.item() causes graph break)."""
+    return module._compute_surprise_alpha(loss_proxy)
 
 
 # ---------------------------------------------------------------------------
@@ -209,9 +231,13 @@ def patch_neural_memory(neural_memory_module: nn.Module) -> None:
     mod = neural_memory_module  # shorthand
 
     # -----------------------------------------------------------------------
-    # Patched update() — replaces @torch._dynamo.disable original
+    # Patched update() — keeps @torch._dynamo.disable because update runs on
+    # DETACHED input (h_for_mem = h_final.detach()) so it doesn't need to be
+    # in the compile graph. The graph break here is fine — it was there before.
+    # The REAL win is in retrieve() which IS in the forward graph.
     # -----------------------------------------------------------------------
 
+    @torch._dynamo.disable
     def _fused_update(
         self,
         x: torch.Tensor,
@@ -220,7 +246,11 @@ def patch_neural_memory(neural_memory_module: nn.Module) -> None:
         differentiable: bool = False,
     ) -> torch.Tensor:
         """
-        Fused memory update using CUDA kernel — no graph break.
+        Fused memory update using CUDA kernel.
+
+        Decorated with @torch._dynamo.disable because update runs on detached
+        input (h_for_mem = h_final.detach()) — it doesn't need to be in the
+        compile graph. The real speedup is from retrieve() being graph-break-free.
 
         Mirrors NeuralMemory.update() contract exactly.  differentiable=True
         falls back to the original MAML path (that case still needs autograd.grad

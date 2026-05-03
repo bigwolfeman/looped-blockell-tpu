@@ -149,6 +149,16 @@ TORCH_LIBRARY_IMPL(titan, CUDA, m) {
 }
 
 // ---------------------------------------------------------------------------
+// Autograd fallthrough — memory_retrieve is read-only; gradients for the
+// query path are handled by the straight-through estimator in Python
+// (q - q.detach()), so the retrieve op itself needs no custom backward.
+// ---------------------------------------------------------------------------
+
+TORCH_LIBRARY_IMPL(titan, Autograd, m) {
+    m.impl("memory_retrieve", torch::CppFunction::makeFallthrough());
+}
+
+// ---------------------------------------------------------------------------
 // Meta (FakeTensor) implementation — shape inference for torch.compile
 //
 // Dynamo traces through the model using "fake" tensors that carry only shape

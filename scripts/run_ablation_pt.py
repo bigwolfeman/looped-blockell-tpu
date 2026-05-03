@@ -313,9 +313,9 @@ def train(cfg: InteropConfig, args):
             weight_decay=cfg.weight_decay, eps=1e-8,
         )
 
-    # Neural memory uses retain_graph=True which conflicts with donated buffers
+    # Memory update moved out of forward() → no graph break → donated_buffer OK
     if cfg.use_neural_memory:
-        torch._functorch.config.donated_buffer = False
+        torch._functorch.config.donated_buffer = False  # retrieve still uses no_grad internals
 
     # torch.compile — use "default" mode (NOT "reduce-overhead" which uses
     # CUDA graphs that reserve ~15GB and cause OOM during eval)
@@ -452,6 +452,17 @@ def train(cfg: InteropConfig, args):
             loss = out["loss"]
 
         loss.backward()
+
+        # ─── Neural memory: update MLP weights (outside compiled forward) ───
+        memory_loss = None
+        if cfg.use_neural_memory and out.get("h_final_for_memory") is not None:
+            if step >= cfg.memory_warmup_steps and step % cfg.memory_update_interval == 0:
+                h_for_mem = out["h_final_for_memory"]
+                for _ in range(cfg.memory_inner_steps):
+                    memory_loss = model.neural_memory.update(
+                        h_for_mem, return_stats=False,
+                        differentiable=False,
+                    )
 
         # ─── CMS: accumulate scores (BETWEEN backward and optimizer step) ───
         if prunable_mods and step <= cfg.prune_end:
@@ -607,12 +618,9 @@ def train(cfg: InteropConfig, args):
                 log_dict["train/density"] = current_density
             # Memory stats
             if cfg.use_neural_memory:
-                if out.get("memory_loss") is not None:
-                    ml = out["memory_loss"]
+                if memory_loss is not None:
+                    ml = memory_loss
                     log_dict["memory/loss"] = ml.item() if hasattr(ml, 'item') else ml
-                if out.get("sigreg_loss") is not None:
-                    sl = out["sigreg_loss"]
-                    log_dict["memory/sigreg_loss"] = sl.item() if hasattr(sl, 'item') else sl
                 if step % (LOG_INTERVAL * 5) == 0:
                     mstats = model.neural_memory.get_memory_stats()
                     for k, v in mstats.items():
