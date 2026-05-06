@@ -103,6 +103,7 @@ class InteropConfig:
     # Block-ELL pruning (core blocks only)
     enable_pruning: bool = False
     tile_size: int = 16
+    macro_tile_size: int = 32
     # ReMoE routing (after compaction)
     enable_routing: bool = False
     n_clusters: int = 16
@@ -582,19 +583,40 @@ class MultiHeadAttention(nn.Module):
         return out
 
 
+def _permute_optimizer_state(optimizer: torch.optim.Optimizer,
+                             param: nn.Parameter, perm: Tensor, dim: int):
+    """Permute Adam exp_avg and exp_avg_sq along the given dimension."""
+    for group in optimizer.param_groups:
+        for p in group["params"]:
+            if p is not param:
+                continue
+            state = optimizer.state.get(p)
+            if state is None:
+                return
+            for key in ("exp_avg", "exp_avg_sq"):
+                if key in state:
+                    state[key].copy_(state[key].index_select(dim, perm))
+            return
+
+
 class PrunableLinear(nn.Module):
-    """Linear layer with 16x16 tile-level pruning + Block-ELL compaction.
+    """Linear layer with 16x16 tile-level pruning + macro-block compaction.
 
     Pre-compact: dense weight [out, in] with tile mask. O(out*in) compute.
-    Post-compact: Block-ELL [R, K_new, B, B] with col_indices. O(R*K_new*B^2) compute.
+    Post-compact: either frozen-dense (small d_ff) or macro-block batched
+    GEMM (medium+ d_ff). Macro block size matches hardware tile size
+    (32 for SM_120/5090, 128 for TPU MXU).
     """
 
-    def __init__(self, in_features: int, out_features: int, tile_size: int = 16, bias: bool = False):
+    def __init__(self, in_features: int, out_features: int, tile_size: int = 16,
+                 macro_tile_size: int = 32, bias: bool = False):
         super().__init__()
         assert in_features % tile_size == 0 and out_features % tile_size == 0
         self.in_features = in_features
         self.out_features = out_features
         self.tile_size = tile_size
+        self.macro_tile_size = macro_tile_size
+        self.tiles_per_macro = macro_tile_size // tile_size
         self.R = out_features // tile_size
         self.C = in_features // tile_size
 
@@ -608,8 +630,10 @@ class PrunableLinear(nn.Module):
         self.register_buffer("tile_mask", torch.ones(self.R, self.C, dtype=torch.bool))
         self.register_buffer("score_ema", torch.zeros(self.R, self.C))
         self._compacted = False
+        self._compact_mode = "dense"  # "dense" or "macro"
         self._all_alive = True
         self._mask_expanded: Tensor | None = None
+        self._k_active_macros: int = self.C // self.tiles_per_macro
 
     def _expand_mask(self) -> Tensor:
         if self._mask_expanded is None:
@@ -625,9 +649,23 @@ class PrunableLinear(nn.Module):
     def forward(self, x: Tensor) -> Tensor:
         if self._all_alive:
             return F.linear(x, self.weight, self.bias)
-        # Both pre-compact (masked) and post-compact (frozen dense) use F.linear.
-        # Post-compact: dead tiles are permanently zeroed but mask still needed
-        # to prevent gradient accumulation from reviving them.
+
+        if self._compacted and self._compact_mode == "macro":
+            # Macro-block mode: only compute active macro-rows of output.
+            # After d_ff reorder, dead rows are packed at the bottom.
+            # Slice weight rows to skip dead macro-rows → smaller GEMM.
+            ar = self._k_active_macros * self.macro_tile_size
+            ar = min(ar, self.out_features)
+            w_active = self.weight[:ar, :]
+            out = F.linear(x, w_active, self.bias[:ar] if self.bias is not None else None)
+            # Pad output back to full out_features (dead rows = 0)
+            if ar < self.out_features:
+                pad = torch.zeros(*x.shape[:-1], self.out_features - ar,
+                                  device=x.device, dtype=out.dtype)
+                out = torch.cat([out, pad], dim=-1)
+            return out
+
+        # Dense mode: full weight with dead tiles zeroed
         mask = self._expand_mask()
         w = self.weight * mask.to(self.weight.dtype)
         return F.linear(x, w, self.bias)
@@ -687,13 +725,78 @@ class PrunableLinear(nn.Module):
             return self._compact_density
         return self.tile_mask.float().mean().item()
 
-    def compact(self, n_clusters: int | None = None) -> int:
-        """Freeze dead tiles and set up routing metadata. Returns K_new.
+    @property
+    def k_active_macros(self) -> int:
+        return self._k_active_macros
 
-        Uses "frozen dense" mode: keeps the weight as a dense parameter with
-        dead tiles permanently zeroed. At d_ff<=2048, dense cuBLAS GEMM is
-        faster than any sparse representation (Block-ELL, BMM, Triton).
-        The mask is retained to zero gradients for dead tiles each step.
+    def reorder_dff_dim(self, paired_layer: "PrunableLinear | None" = None,
+                        optimizer: torch.optim.Optimizer | None = None):
+        """Reorder the d_ff output dimension to pack surviving tiles left.
+
+        For fc1/w_gate/w_up: d_ff is the OUTPUT dim → rows of weight [d_ff, d_model].
+        tile_mask is [R=d_ff/tile, C=d_model/tile]. We permute ROWS.
+
+        The paired w_down has d_ff as INPUT dim → columns of weight [d_model, d_ff].
+        Its tile_mask is [R=d_model/tile, C=d_ff/tile]. We permute its COLUMNS.
+        """
+        with torch.no_grad():
+            B = self.tile_size
+            tpm = self.tiles_per_macro
+
+            # Score each d_ff tile-row by alive count across d_model columns
+            row_importance = self.tile_mask.float().sum(dim=1)  # [R] = d_ff tiles
+            if paired_layer is not None:
+                # w_down's d_ff is its column dim → sum alive per column
+                row_importance = row_importance + paired_layer.tile_mask.float().sum(dim=0)
+
+            # Sort by descending importance → alive tiles packed to low indices
+            perm = row_importance.argsort(descending=True)
+
+            # Permute this layer's rows (d_ff output dimension)
+            self.tile_mask.copy_(self.tile_mask[perm, :])
+            self.score_ema.copy_(self.score_ema[perm, :])
+
+            # Element-level permutation for weight rows
+            elem_perm = torch.arange(self.out_features, device=self.weight.device)
+            for i, p in enumerate(perm):
+                elem_perm[i * B:(i + 1) * B] = torch.arange(p * B, (p + 1) * B,
+                                                              device=self.weight.device)
+            self.weight.data.copy_(self.weight.data[elem_perm, :])
+
+            if optimizer is not None:
+                _permute_optimizer_state(optimizer, self.weight, elem_perm, dim=0)
+
+            # Permute paired layer's columns (d_ff input dimension)
+            if paired_layer is not None:
+                paired_layer.tile_mask.copy_(paired_layer.tile_mask[:, perm])
+                paired_layer.score_ema.copy_(paired_layer.score_ema[:, perm])
+                paired_layer.weight.data.copy_(paired_layer.weight.data[:, elem_perm])
+                paired_layer._mask_expanded = None
+
+                if optimizer is not None:
+                    _permute_optimizer_state(optimizer, paired_layer.weight, elem_perm, dim=1)
+
+            self._mask_expanded = None
+
+            # k_active_macros: how many macro-rows (d_ff) still have alive tiles?
+            max_alive_row = -1
+            for r in range(self.R):
+                if self.tile_mask[r, :].any():
+                    max_alive_row = r
+            if max_alive_row < 0:
+                self._k_active_macros = 0
+            else:
+                self._k_active_macros = (max_alive_row + tpm) // tpm
+
+            return perm
+
+    def compact(self, n_clusters: int | None = None, mode: str = "auto") -> int:
+        """Freeze dead tiles and set up execution mode. Returns K_new.
+
+        Modes:
+          "dense"  — frozen-dense, single cuBLAS GEMM (best for small d_ff)
+          "macro"  — slice weight into active macro columns only (best for medium+ d_ff)
+          "auto"   — pick based on k_active_macros vs total macro columns
         """
         with torch.no_grad():
             B = self.tile_size
@@ -707,6 +810,25 @@ class PrunableLinear(nn.Module):
             self._compacted = True
             self._compact_density = K_new / self.C
             self.K = K_new
+
+            # Choose execution mode
+            # k_active_macros counts active d_ff macro-rows (set by reorder_dff_dim)
+            total_macro_rows = self.R // max(1, self.tiles_per_macro)
+            if mode == "auto":
+                if total_macro_rows > 1 and self._k_active_macros < total_macro_rows * 0.75:
+                    mode = "macro"
+                else:
+                    mode = "dense"
+
+            self._compact_mode = mode
+
+            if mode == "macro":
+                # Slice weight to only active macro columns
+                active_cols = self._k_active_macros * self.macro_tile_size
+                active_cols = min(active_cols, self.in_features)
+                self._macro_active_cols = active_cols
+                # Store original in_features for mask ops
+                self._full_in_features = self.in_features
 
             if n_clusters is not None:
                 rows_per = self.R // n_clusters
@@ -735,9 +857,10 @@ class MLPBlock(nn.Module):
 
         if self.prunable and self.use_swiglu:
             B = cfg.tile_size
-            self.w_gate = PrunableLinear(cfg.d_model, cfg.d_ff, B, bias=False)
-            self.w_up = PrunableLinear(cfg.d_model, cfg.d_ff, B, bias=False)
-            self.w_down = PrunableLinear(cfg.d_ff, cfg.d_model, B, bias=False)
+            M = getattr(cfg, 'macro_tile_size', 32)
+            self.w_gate = PrunableLinear(cfg.d_model, cfg.d_ff, B, M, bias=False)
+            self.w_up = PrunableLinear(cfg.d_model, cfg.d_ff, B, M, bias=False)
+            self.w_down = PrunableLinear(cfg.d_ff, cfg.d_model, B, M, bias=False)
         elif self.use_swiglu:
             self.w_gate = nn.Linear(cfg.d_model, cfg.d_ff, bias=False)
             self.w_up = nn.Linear(cfg.d_model, cfg.d_ff, bias=False)
@@ -745,6 +868,30 @@ class MLPBlock(nn.Module):
         else:
             self.fc1 = nn.Linear(cfg.d_model, cfg.d_ff, bias=True)
             self.fc2 = nn.Linear(cfg.d_ff, cfg.d_model, bias=True)
+
+    def reorder_columns(self, optimizer: torch.optim.Optimizer | None = None):
+        """Reorder d_ff features across gate/up (output rows) and down (input cols).
+
+        Packs surviving d_ff tiles to low indices → dead macro blocks at tail → skip.
+        Call after each prune round, before compact().
+        """
+        if not self.prunable or not self.use_swiglu:
+            return
+        # w_gate output rows = d_ff. w_down input cols = d_ff. Reorder together.
+        perm = self.w_gate.reorder_dff_dim(
+            paired_layer=self.w_down, optimizer=optimizer)
+        # w_up has same d_ff output dimension — apply same row permutation
+        B = self.w_up.tile_size
+        self.w_up.tile_mask.copy_(self.w_up.tile_mask[perm, :])
+        self.w_up.score_ema.copy_(self.w_up.score_ema[perm, :])
+        elem_perm = torch.arange(self.w_up.out_features, device=perm.device)
+        for i, p in enumerate(perm):
+            elem_perm[i * B:(i + 1) * B] = torch.arange(
+                p * B, (p + 1) * B, device=perm.device)
+        self.w_up.weight.data.copy_(self.w_up.weight.data[elem_perm, :])
+        self.w_up._mask_expanded = None
+        if optimizer is not None:
+            _permute_optimizer_state(optimizer, self.w_up.weight, elem_perm, dim=0)
 
     def forward(self, x: Tensor, deterministic: bool = True) -> Tensor:
         if self.use_swiglu:
