@@ -203,8 +203,12 @@ class NSAAttention(BaseAttention):
         bias_cmp = torch.where(causal_cmp, 0.0, float("-inf")).unsqueeze(0).unsqueeze(0)
 
         scores_cmp = torch.matmul(q, k_c.transpose(-2, -1)) * (D ** -0.5) + bias_cmp
+        # Prevent NaN gradients: queries with no valid blocks get uniform scores
+        no_valid = (scores_cmp == float("-inf")).all(dim=-1, keepdim=True)
+        scores_cmp = scores_cmp.masked_fill(no_valid, 0.0)
         attn_cmp = F.softmax(scores_cmp, dim=-1)  # [B, H, S, n_cmp]
-        attn_cmp = attn_cmp.masked_fill(attn_cmp.isnan(), 0.0)
+        # Zero out attention for queries with no valid blocks (gate learns to skip)
+        attn_cmp = attn_cmp.masked_fill(no_valid, 0.0)
         out_compress = torch.matmul(attn_cmp, v_c)
 
         # ─── Branch 2: Selected — reuse compressed scores as block importance ─
@@ -704,8 +708,10 @@ class NSAMoSAAttention(BaseAttention):
         bias_cmp = torch.where(causal_cmp, 0.0, float("-inf")).unsqueeze(0).unsqueeze(0)
 
         scores_cmp = torch.matmul(q, k_c.transpose(-2, -1)) * (D ** -0.5) + bias_cmp
+        no_valid = (scores_cmp == float("-inf")).all(dim=-1, keepdim=True)
+        scores_cmp = scores_cmp.masked_fill(no_valid, 0.0)
         attn_cmp = F.softmax(scores_cmp, dim=-1)
-        attn_cmp = attn_cmp.masked_fill(attn_cmp.isnan(), 0.0)
+        attn_cmp = attn_cmp.masked_fill(no_valid, 0.0)
         out_compress = torch.matmul(attn_cmp, v_c)
 
         # ─── Branch 2: MoSA router-selected attention (O(S) routing) ─────
