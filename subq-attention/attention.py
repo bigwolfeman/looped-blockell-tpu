@@ -16,6 +16,11 @@ from torch import Tensor
 
 ATTENTION_REGISTRY: dict[str, type] = {}
 
+def _load_extension_modules():
+    import importlib, pathlib
+    for f in pathlib.Path(__file__).parent.glob("attention_*.py"):
+        importlib.import_module(f.stem)
+
 
 def register_attention(name: str):
     def decorator(cls):
@@ -752,3 +757,6 @@ class NSAMoSAAttention(BaseAttention):
         )
         out = out.transpose(1, 2).reshape(B, S, self.d_model)
         return self.W_o(out)
+
+# Load extension attention modules (attention_*.py)
+_load_extension_modules()
