@@ -73,44 +73,47 @@ class NSACosineAttention(BaseAttention):
         out_compress = torch.matmul(attn_cmp, v_c)
 
         # ─── Branch 2: Cosine similarity block selection ─────────────────
+        # Global per-head selection (like MegaContext): use mean query to
+        # find relevant blocks, then all queries attend to selected blocks.
         n_blocks = S // bs
         top_b = min(self.top_blocks, n_blocks)
 
-        # Mean-pool keys into block representatives (like MegaContext)
+        # Mean-pool keys into block representatives
         k_mean = k[:, :, :n_blocks * bs].reshape(B, H, n_blocks, bs, D).mean(dim=3)
-        k_mean = F.normalize(k_mean, dim=-1)
-        q_norm = F.normalize(q, dim=-1)
+        k_mean = F.normalize(k_mean, dim=-1)  # [B, H, n_blocks, D]
 
-        # Cosine similarity: each query vs each block mean
-        cos_scores = torch.matmul(q_norm, k_mean.transpose(-2, -1))
+        # Use mean query as retrieval key (like MegaContext uses last-256)
+        q_mean = F.normalize(q.mean(dim=2, keepdim=True), dim=-1)  # [B, H, 1, D]
+        cos_scores = torch.matmul(q_mean, k_mean.transpose(-2, -1)).squeeze(2)  # [B, H, n_blocks]
 
-        # Causal: only score blocks fully in the past
-        block_end = torch.arange(n_blocks, device=x.device) * bs + bs - 1
-        q_pos = torch.arange(S, device=x.device)
-        causal_block = block_end.unsqueeze(0) < q_pos.unsqueeze(1)
-        cos_scores = cos_scores.masked_fill(
-            ~causal_block.unsqueeze(0).unsqueeze(0), float("-inf")
-        )
+        # Select top-k blocks globally per head
+        _, top_idx = cos_scores.topk(top_b, dim=-1)  # [B, H, top_b]
 
-        # Top-k block selection
-        _, top_idx = cos_scores.topk(top_b, dim=-1)
-
-        # Build attendance mask from selected blocks
-        attend_mask = torch.zeros(B, H, S, S, device=x.device, dtype=torch.bool)
+        # Expand to token indices
+        token_indices = []
         for i in range(top_b):
-            block_start = top_idx[..., i] * bs
-            for off in range(bs):
-                pos = (block_start + off).clamp(max=S - 1)
-                attend_mask.scatter_(3, pos.unsqueeze(-1), True)
+            base = top_idx[..., i:i+1] * bs  # [B, H, 1]
+            offsets = torch.arange(bs, device=x.device)
+            token_indices.append(base + offsets)  # [B, H, bs]
+        token_indices = torch.cat(token_indices, dim=-1).clamp(max=S - 1)  # [B, H, top_b*bs]
+        n_sel = token_indices.shape[-1]
 
-        causal = torch.tril(torch.ones(S, S, device=x.device, dtype=torch.bool))
-        attend_mask = attend_mask & causal.unsqueeze(0).unsqueeze(0)
+        # Gather selected K, V — [B, H, n_sel, D]
+        idx_d = token_indices.unsqueeze(-1).expand(-1, -1, -1, D)
+        k_sel = torch.gather(k, 2, idx_d)
+        v_sel = torch.gather(v, 2, idx_d)
 
-        scores_sel = torch.matmul(q, k.transpose(-2, -1)) * (D ** -0.5)
-        scores_sel = scores_sel.masked_fill(~attend_mask, float("-inf"))
+        # Causal: each query can only attend to selected tokens at positions <= its own
+        q_pos = torch.arange(S, device=x.device).unsqueeze(0).unsqueeze(0).unsqueeze(-1)
+        sel_pos = token_indices.unsqueeze(2)  # [B, H, 1, n_sel]
+        causal_sel = sel_pos <= q_pos  # [B, H, S, n_sel]
+
+        # Attention over selected tokens — S×n_sel, NOT S×S
+        scores_sel = torch.matmul(q, k_sel.transpose(-2, -1)) * (D ** -0.5)
+        scores_sel = scores_sel.masked_fill(~causal_sel, float("-inf"))
         attn_sel = F.softmax(scores_sel, dim=-1)
         attn_sel = attn_sel.masked_fill(attn_sel.isnan(), 0.0)
-        out_selected = torch.matmul(attn_sel, v)
+        out_selected = torch.matmul(attn_sel, v_sel)
 
         # ─── Branch 3: Sliding window ────────────────────────────────────
         w = self.window_size
