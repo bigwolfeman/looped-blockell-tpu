@@ -194,14 +194,17 @@ class NSAAttention(BaseAttention):
         k_c = self.k_compress(k_blocks)  # [B, H, n_cmp, D]
         v_c = self.v_compress(v_blocks)
 
-        # Causal mask at block granularity
+        # Causal mask: only attend to FULLY PAST compressed blocks.
+        # Block j contains tokens j*r..(j+1)*r-1. A query at position i can
+        # only see block j if (j+1)*r-1 < i, i.e. j < i//r (strict).
         block_pos = torch.arange(n_cmp, device=x.device)
         query_block = torch.arange(S, device=x.device) // r
-        causal_cmp = block_pos.unsqueeze(0) <= query_block.unsqueeze(1)
+        causal_cmp = block_pos.unsqueeze(0) < query_block.unsqueeze(1)
         bias_cmp = torch.where(causal_cmp, 0.0, float("-inf")).unsqueeze(0).unsqueeze(0)
 
         scores_cmp = torch.matmul(q, k_c.transpose(-2, -1)) * (D ** -0.5) + bias_cmp
         attn_cmp = F.softmax(scores_cmp, dim=-1)  # [B, H, S, n_cmp]
+        attn_cmp = attn_cmp.masked_fill(attn_cmp.isnan(), 0.0)
         out_compress = torch.matmul(attn_cmp, v_c)
 
         # ─── Branch 2: Selected — reuse compressed scores as block importance ─
@@ -502,7 +505,9 @@ class LODAttention(BaseAttention):
         # Causal at LOD2 granularity
         lod2_pos = torch.arange(n_lod2, device=q.device) * g * g
         q_pos = torch.arange(S, device=q.device)
-        causal_lod2 = lod2_pos.unsqueeze(0) <= q_pos.unsqueeze(1)
+        # Strict: only score LOD2 blocks fully in the past
+        lod2_end = lod2_pos + g * g - 1
+        causal_lod2 = lod2_end.unsqueeze(0) < q_pos.unsqueeze(1)
         scores_lod2 = scores_lod2.masked_fill(
             ~causal_lod2.unsqueeze(0).unsqueeze(0), float("-inf")
         )
@@ -695,11 +700,12 @@ class NSAMoSAAttention(BaseAttention):
 
         block_pos = torch.arange(n_cmp, device=x.device)
         query_block = torch.arange(S, device=x.device) // r
-        causal_cmp = block_pos.unsqueeze(0) <= query_block.unsqueeze(1)
+        causal_cmp = block_pos.unsqueeze(0) < query_block.unsqueeze(1)
         bias_cmp = torch.where(causal_cmp, 0.0, float("-inf")).unsqueeze(0).unsqueeze(0)
 
         scores_cmp = torch.matmul(q, k_c.transpose(-2, -1)) * (D ** -0.5) + bias_cmp
         attn_cmp = F.softmax(scores_cmp, dim=-1)
+        attn_cmp = attn_cmp.masked_fill(attn_cmp.isnan(), 0.0)
         out_compress = torch.matmul(attn_cmp, v_c)
 
         # ─── Branch 2: MoSA router-selected attention (O(S) routing) ─────

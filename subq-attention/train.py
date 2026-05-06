@@ -65,32 +65,35 @@ def evaluate(model, loader, device, n_batches: int = 10) -> tuple[float, float]:
 
 
 def measure_scaling(model, device, seq_lengths, batch_size=2, n_iters=5):
-    """Measure wall-clock and VRAM at each sequence length."""
+    """Measure wall-clock and VRAM at each sequence length. Skips OOM lengths."""
     results = {}
     model.eval()
     for sl in seq_lengths:
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
         x = torch.randint(0, 1000, (batch_size, sl), device=device)
-
-        # warmup
-        with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
-            model(x)
-        torch.cuda.synchronize()
-
-        times = []
-        for _ in range(n_iters):
-            torch.cuda.synchronize()
-            t0 = time.perf_counter()
+        try:
             with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
                 model(x)
             torch.cuda.synchronize()
-            times.append(time.perf_counter() - t0)
 
-        peak_mb = torch.cuda.max_memory_allocated() / 1e6
-        avg_ms = sum(times) / len(times) * 1000
-        results[sl] = {"time_ms": avg_ms, "peak_vram_mb": peak_mb}
-        print(f"  seq_len={sl:6d}: {avg_ms:8.1f}ms  {peak_mb:8.0f}MB")
+            times = []
+            for _ in range(n_iters):
+                torch.cuda.synchronize()
+                t0 = time.perf_counter()
+                with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+                    model(x)
+                torch.cuda.synchronize()
+                times.append(time.perf_counter() - t0)
+
+            peak_mb = torch.cuda.max_memory_allocated() / 1e6
+            avg_ms = sum(times) / len(times) * 1000
+            results[sl] = {"time_ms": avg_ms, "peak_vram_mb": peak_mb}
+            print(f"  seq_len={sl:6d}: {avg_ms:8.1f}ms  {peak_mb:8.0f}MB")
+        except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+            print(f"  seq_len={sl:6d}: SKIP (OOM or error)")
+            torch.cuda.empty_cache()
+        del x
 
     model.train()
     return results
@@ -109,7 +112,7 @@ def train(args):
         d_ff=args.d_ff,
         n_layers=args.n_layers,
         vocab_size=49152,
-        max_seq_len=args.seq_len,
+        max_seq_len=max(args.seq_len, 16384) if args.measure_scaling else args.seq_len,
         attn_type=args.attn,
         attn_kwargs=attn_kwargs,
     )
