@@ -604,25 +604,12 @@ class MoSAAttention(BaseAttention):
         # Select top-k tokens per head
         topk_scores, topk_idx = router_scores.topk(k, dim=-1)  # [B, H, k]
 
-        # Gather selected token embeddings per head
-        x_gathered = torch.gather(
-            x.unsqueeze(1).expand(-1, H, -1, -1),  # [B, H, S, D_model]
-            2,
-            topk_idx.unsqueeze(-1).expand(-1, -1, -1, self.d_model),
-        )  # [B, H, k, D_model]
-
-        # Q/K/V projections on selected tokens (project d_model → d_model, then split heads)
-        x_flat = x_gathered.reshape(B, H * k, self.d_model)
-        q = self.W_q(x_flat).reshape(B, H, k, H, D)[:, :, :, 0, :]  # take diagonal head
-        # Simpler: project all, gather per head
-        # Actually just do full projection then gather selected positions
-        q_full = self.W_q(x).reshape(B, S, H, D).permute(0, 2, 1, 3)  # [B, H, S, D]
-        k_full = self.W_k(x).reshape(B, S, H, D).permute(0, 2, 1, 3)
-        v_full = self.W_v(x).reshape(B, S, H, D).permute(0, 2, 1, 3)
+        # Full Q/K/V with RoPE (via base class)
+        q_full, k_full, v_full = self._project_qkv(x)  # [B, H, S, D] each, with RoPE
 
         # Gather only selected positions for each head
         idx_d = topk_idx.unsqueeze(-1).expand(-1, -1, -1, D)
-        q = torch.gather(q_full, 2, idx_d)    # [B, H, k, D]
+        q = torch.gather(q_full, 2, idx_d)       # [B, H, k, D]
         k_proj = torch.gather(k_full, 2, idx_d)
         v_proj = torch.gather(v_full, 2, idx_d)
 
