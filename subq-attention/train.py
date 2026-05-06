@@ -6,6 +6,7 @@ Usage:
 """
 
 import argparse
+import json
 import math
 import os
 import time
@@ -102,7 +103,7 @@ def measure_scaling(model, device, seq_lengths, batch_size=2, n_iters=5):
 def train(args):
     device = torch.device("cuda")
 
-    attn_kwargs = {}
+    attn_kwargs = json.loads(args.attn_kwargs)
     if args.window_size:
         attn_kwargs["window_size"] = args.window_size
 
@@ -250,5 +251,6 @@ if __name__ == "__main__":
     parser.add_argument("--warmup", type=int, default=500)
     parser.add_argument("--window_size", type=int, default=None)
     parser.add_argument("--measure_scaling", action="store_true")
+    parser.add_argument("--attn_kwargs", type=str, default="{}", help="JSON attention kwargs")
     args = parser.parse_args()
     train(args)
